@@ -2,6 +2,7 @@ import { INestApplication } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
 import request from 'supertest';
 import { AppModule } from '../src/app.module';
+import { setupSwagger } from '../src/swagger';
 
 describe('AppController (e2e)', () => {
   let app: INestApplication;
@@ -13,6 +14,7 @@ describe('AppController (e2e)', () => {
 
     app = moduleFixture.createNestApplication();
     app.setGlobalPrefix('api');
+    setupSwagger(app);
 
     await app.init();
   });
@@ -65,5 +67,16 @@ describe('AppController (e2e)', () => {
       .set('Accept-Language', 'en')
       .expect(200)
       .expect({ message: 'Xin chào thế giới!' });
+  });
+
+  it('GET /docs-json should expose the Hello World API', async () => {
+    const response = await request(app.getHttpServer())
+      .get('/docs-json')
+      .expect(200);
+
+    expect(response.body.info.title).toBe('NestJS RealWorld Tutorial API');
+
+    expect(response.body.paths).toHaveProperty('/api/hello');
+    expect(response.body.paths['/api/hello']).toHaveProperty('get');
   });
 });
