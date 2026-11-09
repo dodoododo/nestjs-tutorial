@@ -6,17 +6,19 @@ describe('AppController', () => {
   let appController: AppController;
 
   beforeEach(async () => {
-    const app: TestingModule = await Test.createTestingModule({
+    const module: TestingModule = await Test.createTestingModule({
       controllers: [AppController],
       providers: [AppService],
     }).compile();
 
-    appController = app.get<AppController>(AppController);
+    appController = module.get<AppController>(AppController);
   });
 
-  describe('root', () => {
-    it('should return "Hello World!"', () => {
-      expect(appController.getHello()).toBe('Hello World!');
+  describe('getHello', () => {
+    it('should return a Hello World message', () => {
+      expect(appController.getHello()).toEqual({
+        message: 'Hello World!',
+      });
     });
   });
 });
