@@ -1,13 +1,22 @@
-import { ConflictException, Injectable } from '@nestjs/common';
+import {
+  ConflictException,
+  Injectable,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { InjectRepository } from '@nestjs/typeorm';
+import { compare, hash } from 'bcrypt';
 import { randomUUID } from 'node:crypto';
-import { hash } from 'bcrypt';
 import { I18nService } from 'nestjs-i18n';
 import { QueryFailedError, Repository } from 'typeorm';
 
 import { User } from '../database/entities/user.entity';
-import { BCRYPT_SALT_ROUNDS } from './constants/auth.constant';
+import {
+  BCRYPT_SALT_ROUNDS,
+  INVALID_USER_PASSWORD_HASH,
+  MYSQL_DUPLICATE_ENTRY_CODE,
+} from './constants/auth.constant';
+import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
 import { UserResponseDto } from './dto/user-response.dto';
 
@@ -36,7 +45,8 @@ export class AuthService {
     } catch (error: unknown) {
       if (
         error instanceof QueryFailedError &&
-        (error.driverError as { code?: string }).code === 'ER_DUP_ENTRY'
+        (error.driverError as { code?: string }).code ===
+          MYSQL_DUPLICATE_ENTRY_CODE
       ) {
         throw new ConflictException(this.i18n.t('auth.ACCOUNT_EXISTS'));
       }
@@ -44,6 +54,30 @@ export class AuthService {
       throw error;
     }
 
+    return this.createUserResponse(user);
+  }
+
+  async login(dto: LoginDto): Promise<UserResponseDto> {
+    const email = dto.email.trim().toLowerCase();
+
+    const user = await this.usersRepository
+      .createQueryBuilder('user')
+      .addSelect('user.passwordHash')
+      .where('user.email = :email', { email })
+      .getOne();
+
+    const passwordHash = user?.passwordHash ?? INVALID_USER_PASSWORD_HASH;
+
+    const isPasswordValid = await compare(dto.password, passwordHash);
+
+    if (!user || !isPasswordValid) {
+      throw new UnauthorizedException(this.i18n.t('auth.INVALID_CREDENTIALS'));
+    }
+
+    return this.createUserResponse(user);
+  }
+
+  private async createUserResponse(user: User): Promise<UserResponseDto> {
     const token = await this.jwtService.signAsync({
       sub: user.id,
       jti: randomUUID(),

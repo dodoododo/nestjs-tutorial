@@ -1,7 +1,10 @@
 import {
   Body,
   Controller,
+  HttpCode,
+  HttpStatus,
   Post,
+  UseGuards,
   UsePipes,
   ValidationPipe,
 } from '@nestjs/common';
@@ -9,10 +12,16 @@ import {
   ApiBadRequestResponse,
   ApiConflictResponse,
   ApiCreatedResponse,
+  ApiOkResponse,
+  ApiOperation,
+  ApiTooManyRequestsResponse,
+  ApiUnauthorizedResponse,
   ApiTags,
 } from '@nestjs/swagger';
+import { ThrottlerGuard } from '@nestjs/throttler';
 
 import { AuthService } from './auth.service';
+import { LoginRequestDto } from './dto/login.dto';
 import { RegisterRequestDto } from './dto/register.dto';
 import { UserResponseDto } from './dto/user-response.dto';
 
@@ -29,10 +38,33 @@ export class AuthController {
   constructor(private readonly authService: AuthService) {}
 
   @Post()
+  @ApiOperation({ summary: 'Register a new user' })
   @ApiCreatedResponse({ type: UserResponseDto })
-  @ApiBadRequestResponse({ description: 'Invalid registration data' })
-  @ApiConflictResponse({ description: 'User already exists' })
+  @ApiBadRequestResponse({
+    description: 'Invalid registration data',
+  })
+  @ApiConflictResponse({
+    description: 'Email or username already registered',
+  })
   register(@Body() body: RegisterRequestDto): Promise<UserResponseDto> {
     return this.authService.register(body.user);
+  }
+
+  @Post('login')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(ThrottlerGuard)
+  @ApiOperation({ summary: 'Authenticate a user with JWT' })
+  @ApiOkResponse({ type: UserResponseDto })
+  @ApiBadRequestResponse({
+    description: 'Invalid login request',
+  })
+  @ApiUnauthorizedResponse({
+    description: 'Invalid email or password',
+  })
+  @ApiTooManyRequestsResponse({
+    description: 'Too many login attempts',
+  })
+  login(@Body() body: LoginRequestDto): Promise<UserResponseDto> {
+    return this.authService.login(body.user);
   }
 }

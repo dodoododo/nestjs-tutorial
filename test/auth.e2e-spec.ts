@@ -161,4 +161,108 @@ describe('Auth Registration (e2e)', () => {
       })
       .expect(409);
   });
+
+  it('logs in successfully and returns a JWT', async () => {
+    const user = createUser();
+    createdEmails.push(user.email);
+
+    await request(app.getHttpServer())
+      .post('/api/users')
+      .send({ user })
+      .expect(201);
+
+    const response = await request(app.getHttpServer())
+      .post('/api/users/login')
+      .send({
+        user: {
+          email: user.email.toUpperCase(),
+          password: user.password,
+        },
+      })
+      .expect(200);
+
+    expect(response.body.user.email).toBe(user.email);
+    expect(response.body.user.username).toBe(user.username);
+    expect(response.body.user.token).toEqual(expect.any(String));
+
+    expect(response.body.user).not.toHaveProperty('password');
+    expect(response.body.user).not.toHaveProperty('passwordHash');
+
+    const payload = await app.get(JwtService).verifyAsync<{
+      sub: string;
+      jti: string;
+      exp: number;
+    }>(response.body.user.token);
+
+    const storedUser = await usersRepository.findOneByOrFail({
+      email: user.email,
+    });
+
+    expect(payload.sub).toBe(storedUser.id);
+    expect(payload.jti).toEqual(expect.any(String));
+    expect(payload.exp).toBeGreaterThan(Math.floor(Date.now() / 1000));
+  });
+
+  it('returns the same 401 for unknown email and wrong password', async () => {
+    const user = createUser();
+    createdEmails.push(user.email);
+
+    await request(app.getHttpServer())
+      .post('/api/users')
+      .send({ user })
+      .expect(201);
+
+    const incorrectPassword = await request(app.getHttpServer())
+      .post('/api/users/login')
+      .send({
+        user: {
+          email: user.email,
+          password: 'IncorrectPassword123!',
+        },
+      })
+      .expect(401);
+
+    const unknownEmail = await request(app.getHttpServer())
+      .post('/api/users/login')
+      .send({
+        user: {
+          email: `missing_${randomUUID().slice(0, 8)}@example.test`,
+          password: 'IncorrectPassword123!',
+        },
+      })
+      .expect(401);
+
+    expect(incorrectPassword.body.message).toBe(unknownEmail.body.message);
+  });
+
+  it('rejects invalid login data', async () => {
+    await request(app.getHttpServer())
+      .post('/api/users/login')
+      .send({
+        user: {
+          email: 'invalid-email',
+          password: '',
+        },
+      })
+      .expect(400);
+  });
+
+  it('limits repeated login attempts', async () => {
+    const statuses: number[] = [];
+
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const response = await request(app.getHttpServer())
+        .post('/api/users/login')
+        .send({
+          user: {
+            email: 'unknown@example.test',
+            password: 'IncorrectPassword123!',
+          },
+        });
+
+      statuses.push(response.status);
+    }
+
+    expect(statuses).toContain(429);
+  });
 });
