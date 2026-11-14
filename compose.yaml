@@ -1,0 +1,90 @@
+
+services:
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:?DB_ROOT_PASSWORD is required}
+      MYSQL_DATABASE: ${DB_NAME:?DB_NAME is required}
+      MYSQL_USER: ${DB_USER:?DB_USER is required}
+      MYSQL_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+    ports:
+      - "127.0.0.1:${DB_PORT:?DB_PORT is required}:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  mysql-test:
+    image: mysql:8.4
+    profiles:
+      - test
+    environment:
+      MYSQL_ROOT_PASSWORD: ${TEST_DB_ROOT_PASSWORD:?TEST_DB_ROOT_PASSWORD is required}
+      MYSQL_DATABASE: ${TEST_DB_NAME:?TEST_DB_NAME is required}
+      MYSQL_USER: ${TEST_DB_USER:?TEST_DB_USER is required}
+      MYSQL_PASSWORD: ${TEST_DB_PASSWORD:?TEST_DB_PASSWORD is required}
+    ports:
+      - "127.0.0.1:${TEST_DB_PORT:?TEST_DB_PORT is required}:3306"
+    volumes:
+      - mysql_test_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD}
+    command:
+      - sh
+      - -c
+      - exec redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'REDISCLI_AUTH="$$REDIS_PASSWORD" redis-cli ping | grep -q PONG'
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - redis_data:/data
+
+  redis-test:
+    image: redis:7.4-alpine
+    profiles: ["test"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${TEST_REDIS_PORT:-6380}:6379"
+    environment:
+      REDIS_PASSWORD: ${TEST_REDIS_PASSWORD:?Set TEST_REDIS_PASSWORD}
+    command:
+      - sh
+      - -c
+      - exec redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'REDISCLI_AUTH="$$REDIS_PASSWORD" redis-cli ping | grep -q PONG'
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - redis_test_data:/data
+
+
+volumes:
+  mysql_data:
+  mysql_test_data:
+  redis_data:
+  redis_test_data:
+
