@@ -265,4 +265,83 @@ describe('Auth Registration (e2e)', () => {
 
     expect(statuses).toContain(429);
   });
+
+  it('GET /api/users returns the authenticated user', async () => {
+    const user = createUser();
+    createdEmails.push(user.email);
+
+    const registration = await request(app.getHttpServer())
+      .post('/api/users')
+      .send({ user })
+      .expect(201);
+
+    const token: string = registration.body.user.token;
+
+    const response = await request(app.getHttpServer())
+      .get('/api/users')
+      .set('Authorization', `Bearer ${token}`)
+      .expect(200);
+
+    expect(response.body).toEqual({
+      user: {
+        email: user.email,
+        username: user.username,
+        token,
+        bio: null,
+        image: null,
+      },
+    });
+
+    expect(response.body.user).not.toHaveProperty('passwordHash');
+  });
+
+  it('GET /api/users rejects a missing token', async () => {
+    await request(app.getHttpServer()).get('/api/users').expect(401);
+  });
+
+  it('GET /api/users rejects an expired token', async () => {
+    const user = createUser();
+    createdEmails.push(user.email);
+
+    await request(app.getHttpServer())
+      .post('/api/users')
+      .send({ user })
+      .expect(201);
+
+    const storedUser = await usersRepository.findOneByOrFail({
+      email: user.email,
+    });
+
+    const expiredToken = await app.get(JwtService).signAsync(
+      {
+        sub: storedUser.id,
+        jti: randomUUID(),
+      },
+      { expiresIn: -1 },
+    );
+
+    await request(app.getHttpServer())
+      .get('/api/users')
+      .set('Authorization', `Bearer ${expiredToken}`)
+      .expect(401);
+  });
+
+  it('GET /api/users rejects tokens for deleted users', async () => {
+    const user = createUser();
+    createdEmails.push(user.email);
+
+    const registration = await request(app.getHttpServer())
+      .post('/api/users')
+      .send({ user })
+      .expect(201);
+
+    const token: string = registration.body.user.token;
+
+    await usersRepository.delete({ email: user.email });
+
+    await request(app.getHttpServer())
+      .get('/api/users')
+      .set('Authorization', `Bearer ${token}`)
+      .expect(401);
+  });
 });

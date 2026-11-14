@@ -7,9 +7,14 @@ import { User } from '../database/entities/user.entity';
 import { AuthController } from './auth.controller';
 import { AuthService } from './auth.service';
 import { ThrottlerModule } from '@nestjs/throttler';
+import { PassportModule } from '@nestjs/passport';
+import { JwtStrategy } from './strategies/jwt.strategy';
 
 @Module({
   imports: [
+    PassportModule.register({
+      defaultStrategy: 'jwt',
+    }),
     ThrottlerModule.forRoot([
       {
         ttl: 60_000,
@@ -39,7 +44,7 @@ import { ThrottlerModule } from '@nestjs/throttler';
     }),
   ],
   controllers: [AuthController],
-  providers: [AuthService],
+  providers: [AuthService, JwtStrategy],
   exports: [AuthService],
 })
 export class AuthModule {}

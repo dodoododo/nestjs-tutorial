@@ -6,6 +6,7 @@ export function setupSwagger(app: INestApplication): void {
     .setTitle('NestJS RealWorld Tutorial API')
     .setDescription('Backend API for the RealWorld tutorial project')
     .setVersion('1.0.0')
+    .addBearerAuth()
     .build();
 
   const documentFactory = () => SwaggerModule.createDocument(app, config);

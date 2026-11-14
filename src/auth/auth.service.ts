@@ -77,6 +77,18 @@ export class AuthService {
     return this.createUserResponse(user);
   }
 
+  getCurrentUser(user: User, token: string): UserResponseDto {
+    return {
+      user: {
+        email: user.email,
+        token,
+        username: user.username,
+        bio: user.bio,
+        image: user.image,
+      },
+    };
+  }
+
   private async createUserResponse(user: User): Promise<UserResponseDto> {
     const token = await this.jwtService.signAsync({
       sub: user.id,
