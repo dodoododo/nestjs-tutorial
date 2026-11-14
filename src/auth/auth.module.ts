@@ -9,9 +9,11 @@ import { AuthService } from './auth.service';
 import { ThrottlerModule } from '@nestjs/throttler';
 import { PassportModule } from '@nestjs/passport';
 import { JwtStrategy } from './strategies/jwt.strategy';
+import { RedisModule } from '../redis/redis.module';
 
 @Module({
   imports: [
+    RedisModule,
     PassportModule.register({
       defaultStrategy: 'jwt',
     }),

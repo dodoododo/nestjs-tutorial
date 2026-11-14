@@ -9,6 +9,7 @@ import { Repository } from 'typeorm';
 import { User } from '../../database/entities/user.entity';
 import type { AuthenticatedPrincipal } from '../interfaces/authenticated-request.interface';
 import type { JwtPayload } from '../interfaces/jwt-payload.interface';
+import { RedisService } from '../../redis/redis.service';
 
 @Injectable()
 export class JwtStrategy extends PassportStrategy(Strategy) {
@@ -16,6 +17,7 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     configService: ConfigService,
     @InjectRepository(User)
     private readonly usersRepository: Repository<User>,
+    private readonly redisService: RedisService,
   ) {
     super({
       jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
@@ -34,6 +36,10 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       typeof payload.jti !== 'string' ||
       !Number.isInteger(payload.exp)
     ) {
+      throw new UnauthorizedException();
+    }
+
+    if (await this.redisService.isTokenRevoked(payload.jti)) {
       throw new UnauthorizedException();
     }
 

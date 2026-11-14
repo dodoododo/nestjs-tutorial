@@ -8,6 +8,14 @@ import { DataSource, In, Repository } from 'typeorm';
 
 import { AppModule } from '../src/app.module';
 import { User } from '../src/database/entities/user.entity';
+import { ServiceUnavailableException } from '@nestjs/common';
+import Redis from 'ioredis';
+
+import {
+  REDIS_CLIENT,
+  REVOCATION_KEY_PREFIX,
+} from '../src/redis/redis.constant';
+import { RedisService } from '../src/redis/redis.service';
 
 describe('Auth Registration (e2e)', () => {
   let app: INestApplication;
@@ -343,5 +351,79 @@ describe('Auth Registration (e2e)', () => {
       .get('/api/users')
       .set('Authorization', `Bearer ${token}`)
       .expect(401);
+  });
+
+  it('GET /api/users rejects a revoked JWT', async () => {
+    const user = createUser();
+    createdEmails.push(user.email);
+
+    const registration = await request(app.getHttpServer())
+      .post('/api/users')
+      .send({ user })
+      .expect(201);
+
+    const token: string = registration.body.user.token;
+
+    const payload = await app.get(JwtService).verifyAsync<{
+      sub: string;
+      jti: string;
+      exp: number;
+    }>(token);
+
+    const redisService = app.get(RedisService);
+    const redisClient = app.get<Redis>(REDIS_CLIENT);
+    const key = `${REVOCATION_KEY_PREFIX}${payload.jti}`;
+
+    try {
+      // Token works before revocation.
+      await request(app.getHttpServer())
+        .get('/api/users')
+        .set('Authorization', `Bearer ${token}`)
+        .expect(200);
+
+      await redisService.revokeToken(payload.jti, payload.exp);
+
+      const ttl = await redisClient.ttl(key);
+      expect(ttl).toBeGreaterThan(0);
+
+      // The same token must now be rejected.
+      await request(app.getHttpServer())
+        .get('/api/users')
+        .set('Authorization', `Bearer ${token}`)
+        .expect(401);
+    } finally {
+      // Delete only the revocation created by this test.
+      await redisClient.del(key);
+    }
+  });
+
+  it('GET /api/users fails closed when Redis check fails', async () => {
+    const user = createUser();
+    createdEmails.push(user.email);
+
+    const registration = await request(app.getHttpServer())
+      .post('/api/users')
+      .send({ user })
+      .expect(201);
+
+    const token: string = registration.body.user.token;
+    const redisService = app.get(RedisService);
+
+    const checkSpy = jest
+      .spyOn(redisService, 'isTokenRevoked')
+      .mockRejectedValueOnce(
+        new ServiceUnavailableException(
+          'Authentication temporarily unavailable',
+        ),
+      );
+
+    try {
+      await request(app.getHttpServer())
+        .get('/api/users')
+        .set('Authorization', `Bearer ${token}`)
+        .expect(503);
+    } finally {
+      checkSpy.mockRestore();
+    }
   });
 });
