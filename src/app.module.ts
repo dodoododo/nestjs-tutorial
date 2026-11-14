@@ -15,9 +15,11 @@ import {
   createDatabaseOptions,
   validateDatabaseEnvironment,
 } from './config/database.config';
+import { AuthModule } from './auth/auth.module';
 
 @Module({
   imports: [
+    AuthModule,
     ConfigModule.forRoot({
       isGlobal: true,
       envFilePath: process.env.NODE_ENV === 'test' ? '.env.test' : '.env',
