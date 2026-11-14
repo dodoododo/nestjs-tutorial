@@ -10,6 +10,8 @@ import { ThrottlerModule } from '@nestjs/throttler';
 import { PassportModule } from '@nestjs/passport';
 import { JwtStrategy } from './strategies/jwt.strategy';
 import { RedisModule } from '../redis/redis.module';
+import { LogoutController } from './logout.controller';
+import { LogoutService } from './logout.service';
 
 @Module({
   imports: [
@@ -45,8 +47,8 @@ import { RedisModule } from '../redis/redis.module';
       },
     }),
   ],
-  controllers: [AuthController],
-  providers: [AuthService, JwtStrategy],
+  controllers: [AuthController, LogoutController],
+  providers: [AuthService, JwtStrategy, LogoutService],
   exports: [AuthService],
 })
 export class AuthModule {}

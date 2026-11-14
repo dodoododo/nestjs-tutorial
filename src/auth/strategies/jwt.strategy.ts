@@ -57,6 +57,11 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       throw new UnauthorizedException();
     }
 
-    return { user, token };
+    return {
+      user,
+      token,
+      jti: payload.jti,
+      exp: payload.exp,
+    };
   }
 }

@@ -426,4 +426,97 @@ describe('Auth Registration (e2e)', () => {
       checkSpy.mockRestore();
     }
   });
+
+  it('POST /api/logout revokes the JWT immediately', async () => {
+    const user = createUser();
+    createdEmails.push(user.email);
+
+    const registration = await request(app.getHttpServer())
+      .post('/api/users')
+      .send({ user })
+      .expect(201);
+
+    const token: string = registration.body.user.token;
+
+    const payload = await app.get(JwtService).verifyAsync<{
+      sub: string;
+      jti: string;
+      exp: number;
+    }>(token);
+
+    const redisClient = app.get<Redis>(REDIS_CLIENT);
+    const key = `${REVOCATION_KEY_PREFIX}${payload.jti}`;
+
+    try {
+      await request(app.getHttpServer())
+        .get('/api/users')
+        .set('Authorization', `Bearer ${token}`)
+        .expect(200);
+
+      const logoutResponse = await request(app.getHttpServer())
+        .post('/api/logout')
+        .set('Authorization', `Bearer ${token}`)
+        .expect(204);
+
+      expect(logoutResponse.text).toBe('');
+
+      const ttl = await redisClient.ttl(key);
+      expect(ttl).toBeGreaterThan(0);
+
+      await request(app.getHttpServer())
+        .get('/api/users')
+        .set('Authorization', `Bearer ${token}`)
+        .expect(401);
+    } finally {
+      await redisClient.del(key);
+    }
+  });
+
+  it('POST /api/logout rejects missing JWT', async () => {
+    await request(app.getHttpServer()).post('/api/logout').expect(401);
+  });
+
+  it('POST /api/logout rejects invalid JWT', async () => {
+    await request(app.getHttpServer())
+      .post('/api/logout')
+      .set('Authorization', 'Bearer invalid.jwt.token')
+      .expect(401);
+  });
+
+  it('POST /api/logout returns 503 when Redis revocation fails', async () => {
+    const user = createUser();
+    createdEmails.push(user.email);
+
+    const registration = await request(app.getHttpServer())
+      .post('/api/users')
+      .send({ user })
+      .expect(201);
+
+    const token: string = registration.body.user.token;
+    const redisService = app.get(RedisService);
+
+    const revokeSpy = jest
+      .spyOn(redisService, 'revokeToken')
+      .mockRejectedValueOnce(
+        new ServiceUnavailableException(
+          'Authentication temporarily unavailable',
+        ),
+      );
+
+    try {
+      await request(app.getHttpServer())
+        .post('/api/logout')
+        .set('Authorization', `Bearer ${token}`)
+        .expect(503);
+    } finally {
+      revokeSpy.mockRestore();
+    }
+
+    // Failed revocation must not be reported as success.
+    // The token was not added to the blacklist.
+    await request(app.getHttpServer())
+      .get('/api/users')
+      .set('Authorization', `Bearer ${token}`)
+      .expect(200);
+  });
 });
