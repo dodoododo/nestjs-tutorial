@@ -1,0 +1,5 @@
+{
+  "NOT_FOUND": "Profile not found",
+  "SELF_FOLLOW": "You cannot follow yourself",
+  "ALREADY_FOLLOWING": "You are already following this user"
+}

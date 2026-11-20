@@ -16,10 +16,12 @@ import {
   validateDatabaseEnvironment,
 } from './config/database.config';
 import { AuthModule } from './auth/auth.module';
+import { ProfilesModule } from './profiles/profiles.module';
 
 @Module({
   imports: [
     AuthModule,
+    ProfilesModule,
     ConfigModule.forRoot({
       isGlobal: true,
       envFilePath: process.env.NODE_ENV === 'test' ? '.env.test' : '.env',
