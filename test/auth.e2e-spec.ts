@@ -1,6 +1,7 @@
 import { INestApplication } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { Test } from '@nestjs/testing';
+import { getStorageToken, ThrottlerStorageService } from '@nestjs/throttler';
 import { compare } from 'bcrypt';
 import { randomUUID } from 'node:crypto';
 import request from 'supertest';
@@ -55,6 +56,12 @@ describe('Auth Registration (e2e)', () => {
     }
 
     usersRepository = dataSource.getRepository(User);
+  });
+
+  beforeEach(() => {
+    // Reset this app's real limiter, including hit expirations and its timer,
+    // so the throttling scenario cannot block login tests run after it.
+    app.get<ThrottlerStorageService>(getStorageToken()).onApplicationShutdown();
   });
 
   afterEach(async () => {
@@ -271,7 +278,7 @@ describe('Auth Registration (e2e)', () => {
       statuses.push(response.status);
     }
 
-    expect(statuses).toContain(429);
+    expect(statuses).toEqual([401, 401, 401, 401, 401, 429]);
   });
 
   it('GET /api/users returns the authenticated user', async () => {

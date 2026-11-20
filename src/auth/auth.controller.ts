@@ -5,6 +5,7 @@ import {
   HttpStatus,
   Post,
   Get,
+  Put,
   UseGuards,
   UsePipes,
   ValidationPipe,
@@ -25,6 +26,7 @@ import { ThrottlerGuard } from '@nestjs/throttler';
 import { AuthService } from './auth.service';
 import { LoginRequestDto } from './dto/login.dto';
 import { RegisterRequestDto } from './dto/register.dto';
+import { UpdateUserRequestDto } from './dto/update-user.dto';
 import { UserResponseDto } from './dto/user-response.dto';
 import { CurrentUser } from './decorators/current-user.decorator';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
@@ -71,6 +73,31 @@ export class AuthController {
   })
   login(@Body() body: LoginRequestDto): Promise<UserResponseDto> {
     return this.authService.login(body.user);
+  }
+
+  @Put()
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Update current authenticated user',
+    description:
+      'Updates only supplied fields. An empty user object is a no-op. Bio may be null to clear it. Returns the existing JWT.',
+  })
+  @ApiOkResponse({ type: UserResponseDto })
+  @ApiBadRequestResponse({ description: 'Invalid or unknown update fields' })
+  @ApiConflictResponse({ description: 'Email or username already in use' })
+  @ApiUnauthorizedResponse({
+    description: 'Missing, invalid, expired, or revoked JWT',
+  })
+  updateUser(
+    @CurrentUser() principal: AuthenticatedPrincipal,
+    @Body() body: UpdateUserRequestDto,
+  ): Promise<UserResponseDto> {
+    return this.authService.updateUser(
+      principal.user.id,
+      body.user,
+      principal.token,
+    );
   }
 
   @Get()
