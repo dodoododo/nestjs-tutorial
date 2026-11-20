@@ -51,6 +51,12 @@
     "sharp": "^0.35.5",
     "typeorm": "^0.3.31"
   },
+  "overrides": {
+    "@nestjs/mau": {
+      "inquirer": "8.2.7",
+      "undici": "6.29.1"
+    }
+  },
   "devDependencies": {
     "@nestjs/cli": "^12.0.0",
     "@nestjs/mau": "^0.2.6",

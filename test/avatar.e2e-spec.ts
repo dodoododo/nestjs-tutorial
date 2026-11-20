@@ -37,7 +37,7 @@ import {
 } from '../src/redis/redis.constant';
 import { RedisService } from '../src/redis/redis.service';
 import { setupSwagger } from '../src/swagger';
-import { avatarBuffer } from './helpers/avatar-fixtures';
+import { animatedAvatarBuffer, avatarBuffer } from './helpers/avatar-fixtures';
 
 describe('Public avatar upload (e2e)', () => {
   let app: NestExpressApplication;
@@ -341,6 +341,24 @@ describe('Public avatar upload (e2e)', () => {
     await request(app.getHttpServer())
       .get(response.body.user.image)
       .expect(200);
+  });
+
+  it('rejects animated WebP without changing the current avatar or attachments', async () => {
+    const buffer = await animatedAvatarBuffer();
+    expect((await sharp(buffer).metadata()).pages).toBe(2);
+    await request(app.getHttpServer())
+      .put('/api/users/avatar')
+      .set('Authorization', `Bearer ${token}`)
+      .attach('avatar', buffer, {
+        filename: 'animated.webp',
+        contentType: 'image/webp',
+      })
+      .expect(400);
+    expect(await generatedFiles()).toEqual([]);
+    expect(await ownerAttachments()).toEqual([]);
+    expect((await users.findOneByOrFail({ id: owner.id })).image).toBe(
+      owner.image,
+    );
   });
 
   it('enforces the 5 MiB multipart limit', async () => {

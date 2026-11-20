@@ -26,3 +26,25 @@ export function avatarFile(
     size: buffer.length,
   } as Express.Multer.File;
 }
+
+export function animatedAvatarBuffer() {
+  return sharp({
+    create: {
+      width: 4,
+      height: 8,
+      pageHeight: 4,
+      channels: 3,
+      background: '#3177a0',
+    },
+  })
+    .composite([
+      {
+        input: Buffer.from([255, 0, 0]),
+        raw: { width: 1, height: 1, channels: 3 },
+        left: 0,
+        top: 5,
+      },
+    ])
+    .webp({ loop: 0, delay: [100, 100] })
+    .toBuffer();
+}

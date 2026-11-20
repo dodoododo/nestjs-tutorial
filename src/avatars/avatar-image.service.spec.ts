@@ -7,7 +7,11 @@ import { Test } from '@nestjs/testing';
 import { I18nService } from 'nestjs-i18n';
 import sharp from 'sharp';
 
-import { avatarBuffer, avatarFile } from '../../test/helpers/avatar-fixtures';
+import {
+  animatedAvatarBuffer,
+  avatarBuffer,
+  avatarFile,
+} from '../../test/helpers/avatar-fixtures';
 import { AvatarImageService } from './avatar-image.service';
 import {
   AVATAR_FORMATS,
@@ -109,6 +113,14 @@ describe('AvatarImageService', () => {
   it('rejects excessive decoded pixels even when the compressed input is small', async () => {
     await expect(
       service.validate(avatarFile(await avatarBuffer('png', 5000, 4000))),
+    ).rejects.toThrow(BadRequestException);
+  });
+
+  it('rejects animated WebP rather than publishing only its first frame', async () => {
+    const buffer = await animatedAvatarBuffer();
+    expect((await sharp(buffer).metadata()).pages).toBe(2);
+    await expect(
+      service.validate(avatarFile(buffer, 'image/webp')),
     ).rejects.toThrow(BadRequestException);
   });
 });

@@ -27,6 +27,10 @@
 
 ## Project setup
 
+Use Node.js 26.13.0, the runtime validated for this dependency lockfile. The
+installed Nest CLI fails on Node.js 22.14.0 with `ERR_REQUIRE_CYCLE_MODULE`.
+Select the validated version before installing dependencies or running checks.
+
 ```bash
 $ npm install
 ```

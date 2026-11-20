@@ -198,6 +198,16 @@ describe('Update current user (e2e)', () => {
     expect(await storedUser()).toEqual(before);
   });
 
+  it.each(['a'.repeat(65_535), '\u20ac'.repeat(21_845)])(
+    'accepts a bio at the TEXT byte boundary (case %#)',
+    async (bio) => {
+      expect(Buffer.byteLength(bio, 'utf8')).toBe(65_535);
+      const response = await update({ user: { bio } }).expect(200);
+      expect(response.body.user.bio).toBe(bio);
+      expect((await storedUser()).bio).toBe(bio);
+    },
+  );
+
   it('updates only the token owner and leaves another account unchanged', async () => {
     const other = await registerUser();
     const before = await usersRepository.findOneByOrFail({ id: other.sub });
@@ -268,6 +278,11 @@ describe('Update current user (e2e)', () => {
     ['null password', { password: null }],
     ['non-string password', { password: 12345678 }],
     ['non-string bio', { bio: 123 }],
+    ['bio exceeding TEXT byte capacity', { bio: 'a'.repeat(65_536) }],
+    [
+      'multibyte bio exceeding TEXT byte capacity',
+      { bio: '\u20ac'.repeat(21_846) },
+    ],
   ])('rejects %s without saving any supplied fields', async (_name, fields) => {
     const before = await storedUser();
     await update({ user: { username: 'valid_username', ...fields } }).expect(

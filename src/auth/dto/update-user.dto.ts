@@ -36,12 +36,20 @@ export class UpdateUserDto {
     type: String,
     nullable: true,
     description:
-      'Omit to preserve the bio; null clears it. Empty text is allowed.',
+      'Omit to preserve the bio; null clears it. Empty text is allowed. Maximum 65535 UTF-8 bytes.',
   })
   @ValidateIf(
     (_object, value: unknown) => value !== undefined && value !== null,
   )
   @IsString()
+  @ValidateBy({
+    name: 'maxBioBytes',
+    validator: {
+      validate: (value: unknown) =>
+        typeof value === 'string' && Buffer.byteLength(value, 'utf8') <= 65_535,
+      defaultMessage: () => 'bio must not exceed 65535 UTF-8 bytes',
+    },
+  })
   bio?: string | null;
 
   @ApiPropertyOptional({ minLength: 8, maxLength: 72, writeOnly: true })
