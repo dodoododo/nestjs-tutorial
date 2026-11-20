@@ -1,0 +1,6 @@
+{
+  "FILE_REQUIRED": "An avatar file is required",
+  "INVALID_TYPE": "Only JPEG, PNG and WebP avatars are allowed",
+  "INVALID_IMAGE": "Avatar must be a valid, non-animated image matching its declared MIME type",
+  "TOO_LARGE": "Avatar must not exceed 5 MiB"
+}

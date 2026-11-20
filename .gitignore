@@ -21,3 +21,6 @@ npm-debug.log*
 .DS_Store
 Thumbs.db
 .idea/
+
+# Public avatar binaries (source and migrations stay tracked)
+/storage/avatars/
