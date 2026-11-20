@@ -1,0 +1,5 @@
+{
+  "NOT_FOUND": "Không tìm thấy bài viết",
+  "SLUG_CONFLICT": "Đã có bài viết với tiêu đề tương đương; vui lòng chọn tiêu đề khác",
+  "PERSISTENCE_FAILED": "Không thể lưu hoặc truy xuất bài viết"
+}

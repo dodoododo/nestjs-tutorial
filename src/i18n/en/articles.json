@@ -1,0 +1,5 @@
+{
+  "NOT_FOUND": "Article not found",
+  "SLUG_CONFLICT": "An article with an equivalent title already exists; choose a different title",
+  "PERSISTENCE_FAILED": "Unable to persist or retrieve the article"
+}
