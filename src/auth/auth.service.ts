@@ -18,6 +18,7 @@ import {
 } from './constants/auth.constant';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
+import { UpdateUserDto } from './dto/update-user.dto';
 import { UserResponseDto } from './dto/user-response.dto';
 
 @Injectable()
@@ -75,6 +76,61 @@ export class AuthService {
     }
 
     return this.createUserResponse(user);
+  }
+
+  async updateUser(
+    userId: string,
+    dto: UpdateUserDto,
+    token: string,
+  ): Promise<UserResponseDto> {
+    const changes: Partial<
+      Pick<User, 'username' | 'email' | 'bio' | 'passwordHash'>
+    > = {};
+
+    if (dto.username !== undefined) {
+      changes.username = dto.username.trim();
+    }
+    if (dto.email !== undefined) {
+      changes.email = dto.email.trim().toLowerCase();
+    }
+    if (dto.bio !== undefined) {
+      changes.bio = dto.bio;
+    }
+    if (dto.password !== undefined) {
+      changes.passwordHash = await hash(dto.password, BCRYPT_SALT_ROUNDS);
+    }
+
+    if (Object.keys(changes).length > 0) {
+      try {
+        // Update only supplied columns, without saving a stale principal entity.
+        const result = await this.usersRepository.update(userId, changes);
+        if (result.affected === 0) {
+          throw new UnauthorizedException();
+        }
+      } catch (error: unknown) {
+        if (
+          error instanceof QueryFailedError &&
+          (error.driverError as { code?: string }).code ===
+            MYSQL_DUPLICATE_ENTRY_CODE
+        ) {
+          throw new ConflictException(
+            this.i18n.t('auth.ACCOUNT_UPDATE_CONFLICT'),
+          );
+        }
+        throw error;
+      }
+    }
+
+    const user = await this.usersRepository.findOne({
+      where: { id: userId },
+      select: { email: true, username: true, bio: true, image: true },
+    });
+
+    if (!user) {
+      throw new UnauthorizedException();
+    }
+
+    return this.getCurrentUser(user, token);
   }
 
   getCurrentUser(user: User, token: string): UserResponseDto {
