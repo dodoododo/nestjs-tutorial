@@ -41,6 +41,8 @@ export function createDatabaseOptions(
     username: config.getOrThrow<string>('DB_USER'),
     password: config.getOrThrow<string>('DB_PASSWORD'),
     database: config.getOrThrow<string>('DB_NAME'),
+    supportBigNumbers: true,
+    bigNumberStrings: true,
 
     entities: [`${databasePath}/entities/*.entity{.ts,.js}`],
     migrations: [`${databasePath}/migrations/*{.ts,.js}`],
