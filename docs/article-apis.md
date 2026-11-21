@@ -1,8 +1,9 @@
-# PR4 article APIs: Commits 2, 3 and 4
+# PR4 article APIs: Commits 2–5
 
 Commit 2 adds `POST /api/articles` and `GET /api/articles/:slug`. Commit 3 adds
 `PUT /api/articles/:slug` and `DELETE /api/articles/:slug`. Commit 4 adds
-`GET /api/articles` with filtering and pagination. Schema,
+`GET /api/articles` with filtering and pagination. Commit 5 adds the personalized
+`GET /api/articles/feed`. Schema,
 migrations, `synchronize: false`, and the existing authentication implementation
 remain unchanged. The request and single-article response follow the
 [RealWorld contract](https://realworld-docs.netlify.app/specifications/backend/endpoints/).
@@ -237,9 +238,72 @@ between them; this endpoint does not promise snapshot consistency. Deep offset
 pagination can become slower as the offset grows. The deterministic order
 stabilizes unchanged data, without promising stable pages across new writes.
 
-The collection GET is declared before `GET :slug`. A future static `GET feed`
-must also be registered before `:slug`; this checkpoint does not implement or
-reserve a feed endpoint, and existing slug behavior is preserved.
+The collection GET and static `GET feed` are declared before `GET :slug`.
+Ordinary slugs continue to use the single-article handler.
+
+## Personalized Feed (Commit 5)
+
+`GET /api/articles/feed` requires the existing `JwtAuthGuard`. Missing, invalid,
+expired, incorrectly signed or revoked credentials return 401. Redis revocation
+failures retain the existing fail-closed 503 response. The viewer ID comes only
+from the authenticated principal. Viewer/user IDs in query parameters return
+400; a GET request body cannot change the viewer or feed membership.
+
+The feed follows the [RealWorld Feed contract](https://realworld-docs.netlify.app/specifications/backend/endpoints/#feed-articles)
+and reuses `ArticlesResponseDto`, `ArticleSummaryDto` and `mapArticleSummary`.
+Body is absent from both the SQL projection and response, and authors expose
+only username, bio, image and following. Feed does not introduce another response
+schema or mapper.
+
+`FeedArticlesQueryDto` uses Swagger `PickType` to inherit only `limit` and
+`offset` from the List DTO, including its defaults, transformation functions,
+validation and API documentation. Defaults remain 20 and 0, the limit is 1–100,
+and offset is a nonnegative safe integer. The strict decimal, empty, repeated,
+structured and unknown-parameter rules above apply unchanged. `tag`, `author`
+and `favorited` are unsupported and return 400.
+
+Membership uses a parameterized correlated `EXISTS` predicate on Follow:
+`followerId = authenticated viewer ID AND followingId = article.authorId`.
+The direction is important: a user following the viewer does not add that user's
+articles. No followed-ID list is loaded into application memory. The existing
+unique `(follower_id, following_id)` Follow index and Article indexes support
+the query; no migration is required. Unrelated authors and the viewer's own
+articles are not included automatically. A viewer following nobody, or following
+only authors with no articles, receives exactly
+`{ "articles": [], "articlesCount": 0 }`. Unfollowing changes subsequent feeds.
+
+List and Feed share the private `loadArticlesPage` method. Each endpoint builds
+only its membership predicates; the shared loader counts those matches, orders
+by `article.createdAt DESC, article.id DESC`, applies limit/offset, loads the
+public article/author projection plus favorite and follow subqueries, batches
+all page tags, and calls the pure mapper. No one-to-many page joins multiply
+articles, and no per-article mapping loop executes SQL. All stored tags are
+returned, favorite counts reflect actual relationships, and viewer favorite
+state uses the authenticated viewer. `author.following` is queried using the
+same metadata logic as List, rather than hardcoded to true.
+
+A nonempty Feed request executes three retrieval statements (count, page with
+metadata, batch tags), plus the JWT strategy's user lookup: four SQL statements
+total at both page sizes 1 and 20. Empty and out-of-range feeds execute only the
+count after authentication and retain the full matching total. SQL logger tests
+verify the fixed query count, batch tag retrieval, metadata selection, and body
+and private-column exclusion from feed retrieval. The existing JWT lookup is
+unchanged.
+
+The static Feed route is registered before `:slug`. An anonymous request to
+`/api/articles/feed` therefore returns 401 even if an Article with slug `feed`
+exists; authenticated requests use the feed handler. Creation and editing rules
+are unchanged, so this one static GET path takes precedence over single-article
+lookup for that slug. No additional slug values are reserved.
+
+Count, page and metadata retain List's separate-read consistency limitation.
+A concurrent unfollow can change the count/page or following metadata between
+reads; following normally remains true when data is unchanged. No long-lived
+transaction is added. Deep offsets retain the existing performance cost.
+Unexpected persistence errors reuse the article-specific localized 500 and
+server-side logging without returning SQL or driver details. Swagger documents
+required Bearer authentication, the two query parameters, the shared successful
+response, and validation/authentication/availability errors.
 
 ## Verification
 
@@ -270,6 +334,15 @@ and the existing JWT/Redis security cases for List. A real TypeORM SQL logger
 asserts three anonymous statements and four authenticated statements at both
 page sizes 1 and 20, verifies batch tags and excludes body/private columns from
 list retrieval. All fixtures use the isolated test services below.
+
+Commit 5 adds Feed DTO inheritance/validation tests and service tests for the
+Follow predicate direction, parameter binding, shared metadata mapping, empty
+page totals, concurrent membership changes and sanitized persistence failures.
+Feed E2E coverage includes one/multiple/no followed authors, authors with no
+articles, reverse follows, self exclusion, subsequent unfollows, viewer isolation,
+deterministic paging, actual favorites and full tag lists, strict validation,
+JWT/Redis failures, static-route precedence and the shared Swagger schema. All
+previous List filters and single-article operations remain regression-tested.
 
 E2E fixtures refuse writes outside `127.0.0.1:3308/nestjs_tutorial_test` and require
 the test Redis instance at `127.0.0.1:6380`. Cleanup removes only fixture users,

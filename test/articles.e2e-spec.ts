@@ -82,6 +82,13 @@ describe('Article APIs (e2e)', () => {
     if (authorization !== undefined) req.set('Authorization', authorization);
     return req;
   }
+  function feed(query: Record<string, unknown> = {}, authorization?: string) {
+    const req = request(app.getHttpServer())
+      .get('/api/articles/feed')
+      .query(query);
+    if (authorization !== undefined) req.set('Authorization', authorization);
+    return req;
+  }
   async function seedList(count: number) {
     const records = Array.from({ length: count }, (_, index) => ({
       id: randomUUID(),
@@ -123,12 +130,13 @@ describe('Article APIs (e2e)', () => {
   }
 
   function authenticatedRequest(
-    method: 'post' | 'get' | 'put' | 'delete' | 'list',
+    method: 'post' | 'get' | 'put' | 'delete' | 'list' | 'feed',
     slug: string,
     authorization = `Bearer ${token}`,
   ) {
     if (method === 'post') return post(input(), authorization);
     if (method === 'list') return list({}, authorization);
+    if (method === 'feed') return feed({}, authorization);
     if (method === 'get') return get(slug, authorization);
     return mutate(method, slug, { body: 'Changed' }, authorization);
   }
@@ -238,7 +246,7 @@ describe('Article APIs (e2e)', () => {
     expect(await articles.countBy({ authorId: author.id })).toBe(0);
   });
 
-  it.each(['post', 'get', 'put', 'delete', 'list'] as const)(
+  it.each(['post', 'get', 'put', 'delete', 'list', 'feed'] as const)(
     '%s rejects invalid, expired, incorrectly signed and revoked JWTs',
     async (method) => {
       const article = await create();
@@ -274,7 +282,7 @@ describe('Article APIs (e2e)', () => {
     },
   );
 
-  it.each(['post', 'get', 'put', 'delete', 'list'] as const)(
+  it.each(['post', 'get', 'put', 'delete', 'list', 'feed'] as const)(
     '%s fails closed when Redis is unavailable',
     async (method) => {
       const article = await create();
@@ -1257,7 +1265,320 @@ describe('Article APIs (e2e)', () => {
     });
   });
 
-  it('documents only the five article operations and their DTOs', async () => {
+  describe('Feed Articles', () => {
+    let viewerAuthorization: string;
+    function currentFeed(query: Record<string, unknown> = {}) {
+      return feed(query, viewerAuthorization);
+    }
+    beforeEach(async () => {
+      const viewerToken = await app
+        .get(JwtService)
+        .signAsync({ sub: viewer.id, jti: randomUUID() });
+      viewerAuthorization = `Bearer ${viewerToken}`;
+    });
+
+    it('returns exactly an empty collection when following nobody, despite existing articles', async () => {
+      const records = await seedList(2);
+      await articles.update(records[0].id, { authorId: viewer.id });
+      // The reverse follow must not grant membership in viewer's feed.
+      await dataSource
+        .getRepository(Follow)
+        .insert({ followerId: author.id, followingId: viewer.id });
+      expect((await currentFeed().expect(200)).body).toEqual({
+        articles: [],
+        articlesCount: 0,
+      });
+    });
+
+    it('returns an empty feed when a followed author has no articles', async () => {
+      await seedList(2);
+      await dataSource
+        .getRepository(Follow)
+        .insert({ followerId: viewer.id, followingId: other.id });
+      expect((await currentFeed().expect(200)).body).toEqual({
+        articles: [],
+        articlesCount: 0,
+      });
+    });
+
+    it('combines followed authors, excludes self/unrelated authors and reflects subsequent unfollows', async () => {
+      const records = await seedList(5);
+      await articles.update(records[1].id, { authorId: other.id });
+      await articles.update(records[3].id, { authorId: other.id });
+      await articles.update(records[4].id, { authorId: viewer.id });
+      const follows = dataSource.getRepository(Follow);
+      await follows.insert({ followerId: viewer.id, followingId: author.id });
+      const oneAuthor = (await currentFeed().expect(200))
+        .body as ArticlesResponseDto;
+      expect(oneAuthor.articlesCount).toBe(2);
+      expect(oneAuthor.articles.map((article) => article.slug)).toEqual([
+        records[0].slug,
+        records[2].slug,
+      ]);
+      await follows.insert({ followerId: viewer.id, followingId: other.id });
+      const bothAuthors = (await currentFeed().expect(200))
+        .body as ArticlesResponseDto;
+      expect(bothAuthors.articlesCount).toBe(4);
+      expect(bothAuthors.articles.map((article) => article.slug)).toEqual(
+        records.slice(0, 4).map((record) => record.slug),
+      );
+      expect(
+        bothAuthors.articles.every((article) => article.author.following),
+      ).toBe(true);
+      expect((await feed({}, `Bearer ${token}`).expect(200)).body).toEqual({
+        articles: [],
+        articlesCount: 0,
+      });
+      await request(app.getHttpServer())
+        .delete(`/api/profiles/${encodeURIComponent(author.username)}/follow`)
+        .set('Authorization', viewerAuthorization)
+        .expect(200);
+      const afterUnfollow = (await currentFeed().expect(200))
+        .body as ArticlesResponseDto;
+      expect(afterUnfollow.articlesCount).toBe(2);
+      expect(afterUnfollow.articles.map((article) => article.slug)).toEqual([
+        records[1].slug,
+        records[3].slug,
+      ]);
+    });
+
+    it('filters before pagination, defaults to 20 and orders timestamp ties by ID across followed authors', async () => {
+      const records = await seedList(26);
+      const otherAuthorIds = records
+        .filter((_, index) => index % 2 === 1)
+        .map((record) => record.id);
+      await articles.update({ id: In(otherAuthorIds) }, { authorId: other.id });
+      await articles.update(records[0].id, { authorId: viewer.id });
+      await dataSource.getRepository(Follow).insert([
+        { followerId: viewer.id, followingId: author.id },
+        { followerId: viewer.id, followingId: other.id },
+      ]);
+      const expected = records.slice(1);
+      const first = (await currentFeed().expect(200))
+        .body as ArticlesResponseDto;
+      expect(first.articlesCount).toBe(25);
+      expect(first.articles.map((article) => article.slug)).toEqual(
+        expected.slice(0, 20).map((record) => record.slug),
+      );
+      const second = (await currentFeed({ offset: 20 }).expect(200))
+        .body as ArticlesResponseDto;
+      expect(second.articlesCount).toBe(25);
+      expect(second.articles.map((article) => article.slug)).toEqual(
+        expected.slice(20).map((record) => record.slug),
+      );
+      const page = (await currentFeed({ limit: 2, offset: 1 }).expect(200))
+        .body as ArticlesResponseDto;
+      expect(page.articlesCount).toBe(25);
+      expect(page.articles.map((article) => article.slug)).toEqual(
+        expected.slice(1, 3).map((record) => record.slug),
+      );
+      expect(
+        (await currentFeed({ limit: 1 }).expect(200)).body.articles,
+      ).toHaveLength(1);
+      expect(
+        (await currentFeed({ limit: 100 }).expect(200)).body.articles,
+      ).toHaveLength(25);
+      for (const offset of [25, 100, Number.MAX_SAFE_INTEGER]) {
+        expect((await currentFeed({ offset }).expect(200)).body).toEqual({
+          articles: [],
+          articlesCount: 25,
+        });
+      }
+    });
+
+    it('reuses public summary mapping and actual viewer metadata without duplicate rows', async () => {
+      const records = await seedList(2);
+      const names = [tag('one'), tag('two')];
+      const storedTags = await tags.save(names.map((name) => ({ name })));
+      await dataSource
+        .getRepository(ArticleTag)
+        .insert(
+          storedTags.map((storedTag) => ({
+            articleId: records[0].id,
+            tagId: storedTag.id,
+          })),
+        );
+      await dataSource.getRepository(ArticleFavorite).insert([
+        { articleId: records[0].id, userId: viewer.id },
+        { articleId: records[0].id, userId: other.id },
+        { articleId: records[1].id, userId: other.id },
+      ]);
+      await dataSource
+        .getRepository(Follow)
+        .insert({ followerId: viewer.id, followingId: author.id });
+      const response = (await currentFeed().expect(200))
+        .body as ArticlesResponseDto;
+      expect(response.articlesCount).toBe(2);
+      expect(response.articles).toHaveLength(2);
+      expect(response.articles[0]).toEqual({
+        slug: records[0].slug,
+        title: records[0].title,
+        description: records[0].description,
+        tagList: names.sort(),
+        createdAt: records[0].createdAt.toISOString(),
+        updatedAt: records[0].updatedAt.toISOString(),
+        favoritesCount: 2,
+        favorited: true,
+        author: {
+          username: author.username,
+          bio: null,
+          image: null,
+          following: true,
+        },
+      });
+      expect(response.articles[1]).toMatchObject({
+        tagList: [],
+        favoritesCount: 1,
+        favorited: false,
+        author: { following: true },
+      });
+      for (const article of response.articles) {
+        expect(Object.keys(article).sort()).toEqual(
+          [
+            'slug',
+            'title',
+            'description',
+            'tagList',
+            'createdAt',
+            'updatedAt',
+            'favorited',
+            'favoritesCount',
+            'author',
+          ].sort(),
+        );
+        expect(Object.keys(article.author).sort()).toEqual(
+          ['username', 'bio', 'image', 'following'].sort(),
+        );
+      }
+    });
+
+    it('requires authentication and matches the static route even when an article has slug feed', async () => {
+      await create({ title: 'feed' });
+      const ordinary = await create();
+      await feed().expect(401);
+      expect((await currentFeed().expect(200)).body).toEqual({
+        articles: [],
+        articlesCount: 0,
+      });
+      expect((await get(ordinary.slug).expect(200)).body.article.slug).toBe(
+        ordinary.slug,
+      );
+      expect(
+        (await list({ author: author.username }).expect(200)).body
+          .articlesCount,
+      ).toBe(2);
+    });
+
+    it('ignores a forged viewer in a GET body and rejects viewer query parameters', async () => {
+      await seedList(2);
+      await dataSource
+        .getRepository(Follow)
+        .insert({ followerId: viewer.id, followingId: author.id });
+      expect((await currentFeed().expect(200)).body.articlesCount).toBe(2);
+      const forged = await feed({}, `Bearer ${token}`)
+        .send({ viewerId: viewer.id, userId: viewer.id })
+        .expect(200);
+      expect(forged.body).toEqual({ articles: [], articlesCount: 0 });
+      for (const name of ['viewerId', 'userId', 'followerId']) {
+        await currentFeed({ [name]: viewer.id }).expect(400);
+      }
+    });
+
+    it.each([
+      'limit=-1',
+      'limit=0',
+      'limit=101',
+      'limit=1.5',
+      'limit=1.0',
+      'limit=NaN',
+      'limit=Infinity',
+      'limit=1x',
+      'limit=1e2',
+      'limit=0x10',
+      'limit=',
+      'limit=%20',
+      'limit=1%0A',
+      'offset=-1',
+      'offset=1.5',
+      'offset=NaN',
+      'offset=Infinity',
+      'offset=9007199254740992',
+      'offset=',
+      'offset=1%0A',
+      'limit=1&limit=2',
+      'offset=0&offset=1',
+      'limit[]=1',
+      'limit[value]=1',
+      'offset[]=0',
+      'offset[value]=0',
+      'tag=nestjs',
+      'author=jacob',
+      'favorited=alice',
+      'unknown=x',
+    ])('rejects malformed or unsupported query %s', async (query) => {
+      await request(app.getHttpServer())
+        .get(`/api/articles/feed?${query}`)
+        .set('Authorization', viewerAuthorization)
+        .expect(400);
+    });
+
+    it('uses four total SQL statements at page sizes 1 and 20 with batch metadata and no body selection', async () => {
+      const records = await seedList(21);
+      const storedTags = await tags.save(
+        [tag('one'), tag('two')].map((name) => ({ name })),
+      );
+      await dataSource
+        .getRepository(ArticleTag)
+        .insert(
+          records.flatMap((article) =>
+            storedTags.map((storedTag) => ({
+              articleId: article.id,
+              tagId: storedTag.id,
+            })),
+          ),
+        );
+      await dataSource
+        .getRepository(ArticleFavorite)
+        .insert(
+          records.map((article) => ({
+            articleId: article.id,
+            userId: viewer.id,
+          })),
+        );
+      await dataSource
+        .getRepository(Follow)
+        .insert({ followerId: viewer.id, followingId: author.id });
+      const sql = jest.spyOn(dataSource.logger, 'logQuery');
+      for (const limit of [1, 20]) {
+        sql.mockClear();
+        const response = (await currentFeed({ limit }).expect(200))
+          .body as ArticlesResponseDto;
+        expect(response.articlesCount).toBe(21);
+        expect(response.articles).toHaveLength(limit);
+        expect(
+          response.articles.every(
+            (article) =>
+              article.tagList.length === 2 &&
+              article.favoritesCount === 1 &&
+              article.favorited &&
+              article.author.following,
+          ),
+        ).toBe(true);
+        expect(sql).toHaveBeenCalledTimes(4); // JWT user lookup, count, page+metadata, batch tags
+        const retrieval = sql.mock.calls.slice(1).map(([query]) => query);
+        expect(retrieval.join('\n')).not.toMatch(
+          /`body`|`email`|`password_hash`/,
+        );
+        expect(retrieval[0]).toContain('EXISTS');
+        expect(retrieval[1]).toContain(' AS `favoritesCount`');
+        expect(retrieval[1]).toContain(' AS `favorited`');
+        expect(retrieval[1]).toContain(' AS `following`');
+        expect(retrieval[2]).toContain(' IN (');
+      }
+    });
+  });
+
+  it('documents only the six article operations and their DTOs', async () => {
     const response = await request(app.getHttpServer())
       .get('/docs-json')
       .expect(200);
@@ -1265,11 +1586,37 @@ describe('Article APIs (e2e)', () => {
       Object.keys(response.body.paths).filter((path) =>
         path.startsWith('/api/articles'),
       ),
-    ).toEqual(['/api/articles', '/api/articles/{slug}']);
+    ).toEqual(['/api/articles', '/api/articles/feed', '/api/articles/{slug}']);
     expect(
       response.body.paths['/api/articles'].post.responses['201'],
     ).toBeDefined();
     const collection = response.body.paths['/api/articles'];
+    const feedOperation = response.body.paths['/api/articles/feed'].get;
+    expect(feedOperation.security).toEqual([{ bearer: [] }]);
+    expect(
+      feedOperation.parameters
+        .map((parameter: { name: string }) => parameter.name)
+        .sort(),
+    ).toEqual(['limit', 'offset']);
+    expect(
+      feedOperation.parameters.find(
+        (parameter: { name: string }) => parameter.name === 'limit',
+      ).schema,
+    ).toMatchObject({ default: 20, minimum: 1, maximum: 100 });
+    expect(
+      feedOperation.parameters.find(
+        (parameter: { name: string }) => parameter.name === 'offset',
+      ).schema,
+    ).toMatchObject({
+      default: 0,
+      minimum: 0,
+      maximum: Number.MAX_SAFE_INTEGER,
+    });
+    expect(
+      feedOperation.responses['200'].content['application/json'].schema.$ref,
+    ).toBe('#/components/schemas/ArticlesResponseDto');
+    for (const status of ['400', '401', '503'])
+      expect(feedOperation.responses[status]).toBeDefined();
     expect(Object.keys(collection).sort()).toEqual(['get', 'post']);
     expect(collection.get.security).toEqual([{}, { bearer: [] }]);
     expect(

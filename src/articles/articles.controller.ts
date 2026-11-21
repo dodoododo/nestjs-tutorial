@@ -37,6 +37,7 @@ import { CreateArticleRequestDto } from './dto/create-article.dto';
 import { UpdateArticleRequestDto } from './dto/update-article.dto';
 import { ListArticlesQueryDto } from './dto/list-articles-query.dto';
 import { ArticlesResponseDto } from './dto/articles-response.dto';
+import { FeedArticlesQueryDto } from './dto/feed-articles-query.dto';
 
 @ApiTags('Articles')
 @ApiUnauthorizedResponse({
@@ -74,8 +75,7 @@ export class ArticlesController {
     return this.articles.createArticle(body.article, principal.user.id);
   }
 
-  // Collection/static GET routes belong above :slug. Add a future feed route
-  // here as well, before the dynamic route, when that endpoint is implemented.
+  // Collection/static GET routes belong above :slug.
   @Get()
   @UseGuards(OptionalJwtAuthGuard)
   @UsePipes(
@@ -100,6 +100,32 @@ export class ArticlesController {
     @CurrentUser() principal: AuthenticatedPrincipal | undefined,
   ): Promise<ArticlesResponseDto> {
     return this.articles.listArticles(query, principal?.user.id);
+  }
+
+  @Get('feed')
+  @UseGuards(JwtAuthGuard)
+  @UsePipes(
+    new ValidationPipe({
+      transform: true,
+      whitelist: true,
+      forbidNonWhitelisted: true,
+    }),
+  )
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Get the current user’s article feed',
+    description:
+      'Articles by followed authors, newest first. Accepts only limit and offset. The viewer comes from the required JWT.',
+  })
+  @ApiOkResponse({ type: ArticlesResponseDto })
+  @ApiBadRequestResponse({
+    description: 'Invalid, repeated or unknown query parameters',
+  })
+  feed(
+    @Query() query: FeedArticlesQueryDto,
+    @CurrentUser() principal: AuthenticatedPrincipal,
+  ): Promise<ArticlesResponseDto> {
+    return this.articles.feedArticles(query, principal.user.id);
   }
 
   @Get(':slug')

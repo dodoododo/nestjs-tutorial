@@ -11,6 +11,8 @@ import { ArticleTag } from '../database/entities/article-tag.entity';
 import { ArticlesService } from './articles.service';
 import { ListArticlesQueryDto } from './dto/list-articles-query.dto';
 import { User } from '../database/entities/user.entity';
+import { Follow } from '../database/entities/follow.entity';
+import { FeedArticlesQueryDto } from './dto/feed-articles-query.dto';
 
 describe('ArticlesService', () => {
   const loaded = {
@@ -243,6 +245,134 @@ describe('ArticlesService', () => {
         cause,
       });
     });
+  });
+
+  describe('feedArticles', () => {
+    it('filters Follow in the correct direction and reuses batch metadata without hardcoding following', async () => {
+      qb.getRawAndEntities.mockResolvedValueOnce({
+        entities: [loaded, { ...loaded, id: 'second', slug: 'second' }],
+        raw: [
+          {
+            article_id: 'second',
+            favoritesCount: '0',
+            favorited: '0',
+            following: '0',
+          },
+          {
+            article_id: loaded.id,
+            favoritesCount: '2',
+            favorited: '1',
+            following: '1',
+          },
+        ],
+      });
+      const result = await service.feedArticles(
+        new FeedArticlesQueryDto(),
+        'viewer',
+      );
+      expect(qb.from).toHaveBeenCalledWith(Follow, 'feedFollow');
+      expect(qb.where).toHaveBeenCalledWith(
+        'feedFollow.followerId = :feedViewerId',
+      );
+      expect(qb.andWhere).toHaveBeenCalledWith(
+        'feedFollow.followingId = article.authorId',
+      );
+      expect(qb.andWhere).toHaveBeenCalledWith('EXISTS (SELECT 1)', {
+        feedViewerId: 'viewer',
+      });
+      expect(qb.setParameter).toHaveBeenCalledWith('viewerId', 'viewer');
+      expect(manager.find).not.toHaveBeenCalled();
+      expect(manager.findOne).not.toHaveBeenCalled();
+      expect(qb.getRawMany).toHaveBeenCalledTimes(1);
+      expect(qb.getCount).toHaveBeenCalledTimes(1);
+      expect(qb.getRawAndEntities).toHaveBeenCalledTimes(1);
+      expect(qb.limit).toHaveBeenCalledWith(20);
+      expect(qb.offset).toHaveBeenCalledWith(0);
+      expect(qb.orderBy).toHaveBeenCalledWith('article.createdAt', 'DESC');
+      expect(qb.addOrderBy).toHaveBeenCalledWith('article.id', 'DESC');
+      expect(result.articlesCount).toBe(3);
+      expect(result.articles[0]).toMatchObject({
+        tagList: ['nestjs'],
+        favoritesCount: 2,
+        favorited: true,
+        author: { following: true },
+      });
+      expect(result.articles[1]).toMatchObject({
+        tagList: [],
+        favoritesCount: 0,
+        favorited: false,
+        author: { following: false },
+      });
+      expect(result.articles[0]).not.toHaveProperty('body');
+      const projection = qb.select.mock.calls.find(([columns]) =>
+        Array.isArray(columns),
+      )![0] as string[];
+      expect(projection).not.toContain('article.body');
+      expect(projection).not.toContain('author.email');
+      expect(transaction).not.toHaveBeenCalled();
+    });
+
+    it.each([0, 3])(
+      'retains total %i on empty or out-of-range feeds without loading metadata',
+      async (count) => {
+        qb.getCount.mockResolvedValueOnce(count);
+        await expect(
+          service.feedArticles(
+            Object.assign(new FeedArticlesQueryDto(), { offset: 10 }),
+            'viewer',
+          ),
+        ).resolves.toEqual({ articles: [], articlesCount: count });
+        expect(qb.getRawAndEntities).not.toHaveBeenCalled();
+        expect(qb.getRawMany).not.toHaveBeenCalled();
+      },
+    );
+
+    it('applies custom pagination after filtering and retains totals if a concurrent unfollow empties the page', async () => {
+      qb.getRawAndEntities.mockResolvedValueOnce({ entities: [], raw: [] });
+      await expect(
+        service.feedArticles(
+          Object.assign(new FeedArticlesQueryDto(), { limit: 1, offset: 2 }),
+          'viewer',
+        ),
+      ).resolves.toEqual({ articles: [], articlesCount: 3 });
+      expect(qb.limit).toHaveBeenCalledWith(1);
+      expect(qb.offset).toHaveBeenCalledWith(2);
+      expect(qb.getRawMany).not.toHaveBeenCalled();
+    });
+
+    it.each(['getCount', 'getRawAndEntities', 'getRawMany'] as const)(
+      'sanitizes failures during %s using article errors',
+      async (read) => {
+        const cause = failure('ER_BAD_FIELD_ERROR');
+        const log = jest
+          .spyOn(Logger.prototype, 'error')
+          .mockImplementation(() => undefined);
+        qb.getRawAndEntities.mockResolvedValue({
+          entities: [loaded],
+          raw: [
+            {
+              article_id: loaded.id,
+              favoritesCount: '0',
+              favorited: '0',
+              following: '1',
+            },
+          ],
+        });
+        qb[read].mockRejectedValueOnce(cause);
+        await expect(
+          service.feedArticles(new FeedArticlesQueryDto(), 'viewer'),
+        ).rejects.toMatchObject({
+          status: 500,
+          message: 'articles.PERSISTENCE_FAILED',
+          cause,
+        });
+        expect(log).toHaveBeenCalledWith(
+          'Article persistence failed',
+          cause.stack,
+        );
+        expect(log).toHaveBeenCalledTimes(1);
+      },
+    );
   });
 
   it('uses the transaction manager for every write/read and deduplicates normalized tags', async () => {
