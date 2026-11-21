@@ -608,7 +608,9 @@ describe('Article foundation (database e2e)', () => {
   });
 
   it('reverts, reapplies and repeats the migration while preserving all PR2/PR3 records', async () => {
-    for (const table of newTables) {
+    // Comments depends on Articles: revert that known descendant first, only
+    // when every table to be dropped is empty in the guarded test database.
+    for (const table of [...newTables, 'comments']) {
       const [{ count }] = (await dataSource.query(
         `SELECT COUNT(*) AS count FROM ${table}`,
       )) as { count: string }[];
@@ -648,10 +650,20 @@ describe('Article foundation (database e2e)', () => {
     const history = (await dataSource.query(
       'SELECT id, timestamp, name FROM migrations ORDER BY id',
     )) as { id: number; timestamp: string; name: string }[];
-    expect(history.at(-1)?.name).toBe('CreateArticles1795178319697');
+    expect(history.slice(-2).map((migration) => migration.name)).toEqual([
+      'CreateArticles1795178319697',
+      'CreateComments1795251668000',
+    ]);
     expect(await dataSource.showMigrations()).toBe(false);
     const runner = dataSource.createQueryRunner();
     try {
+      await dataSource.undoLastMigration({ transaction: 'none' });
+      expect(await runner.hasTable('comments')).toBe(false);
+      expect(
+        await dataSource.query(
+          'SELECT id, timestamp, name FROM migrations ORDER BY id',
+        ),
+      ).toEqual(history.slice(0, -1));
       await dataSource.undoLastMigration({ transaction: 'none' });
       for (const table of newTables)
         expect(await runner.hasTable(table)).toBe(false);
@@ -660,13 +672,15 @@ describe('Article foundation (database e2e)', () => {
         await dataSource.query(
           'SELECT id, timestamp, name FROM migrations ORDER BY id',
         ),
-      ).toEqual(history.slice(0, -1));
+      ).toEqual(history.slice(0, -2));
       const applied = await dataSource.runMigrations({ transaction: 'none' });
       expect(applied.map((migration) => migration.name)).toEqual([
         'CreateArticles1795178319697',
+        'CreateComments1795251668000',
       ]);
       for (const table of newTables)
         expect(await runner.hasTable(table)).toBe(true);
+      expect(await runner.hasTable('comments')).toBe(true);
       expect(await snapshot()).toEqual(before);
       expect(await dataSource.runMigrations({ transaction: 'none' })).toEqual(
         [],
