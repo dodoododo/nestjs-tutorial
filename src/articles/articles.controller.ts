@@ -65,7 +65,7 @@ export class ArticlesController {
   @ApiOperation({ summary: 'Create an article' })
   @ApiCreatedResponse({ type: ArticleResponseDto })
   @ApiBadRequestResponse({
-    description: 'Invalid article input or unknown fields',
+    description: 'Invalid article input, unknown fields or reserved feed slug',
   })
   @ApiConflictResponse({
     description: 'An equivalent article slug already exists',
@@ -214,11 +214,11 @@ export class ArticlesController {
   @ApiOperation({
     summary: 'Update an article owned by the current user',
     description:
-      'Omitted fields are preserved. An empty article object is a no-op. Changing the title regenerates the slug. Tag updates are not accepted.',
+      'Omitted fields are preserved. An empty article object is a no-op. Changing the title regenerates the slug; the slug feed is reserved. Tag updates are not accepted.',
   })
   @ApiOkResponse({ type: ArticleResponseDto })
   @ApiBadRequestResponse({
-    description: 'Invalid article input or unknown fields',
+    description: 'Invalid article input, unknown fields or reserved feed slug',
   })
   @ApiForbiddenResponse({
     description: 'Only the article author may update it',

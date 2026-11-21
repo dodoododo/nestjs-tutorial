@@ -271,6 +271,56 @@ describe('Article APIs (e2e)', () => {
     expect(await articles.countBy({ authorId: author.id })).toBe(0);
   });
 
+  it.each(['feed', 'FEED', 'Fééd', 'ＦＥＥＤ'])(
+    'rejects the reserved generated slug for %j on Create and Update without persisting changes',
+    async (title) => {
+      const created = await post(
+        input({ title, tagList: [tag('reserved')] }),
+      ).expect(400);
+      expect(created.body.message).toBe(
+        "This title produces the reserved article slug 'feed'; choose a different title",
+      );
+      expect(await articles.countBy({ authorId: author.id })).toBe(0);
+      expect(await tags.countBy({ name: tag('reserved') })).toBe(0);
+      const article = await create({ tagList: [tag('preserved')] });
+      const before = await articles.findOneByOrFail({ slug: article.slug });
+      const updated = await mutate('put', article.slug, {
+        title,
+        body: 'Must not persist',
+      }).expect(400);
+      expect(updated.body.message).toBe(created.body.message);
+      expect(await articles.findOneByOrFail({ id: before.id })).toEqual(before);
+      expect((await get(article.slug).expect(200)).body.article).toEqual(
+        article,
+      );
+      await get('feed').expect(401);
+    },
+  );
+
+  it('localizes reserved slugs and allows other slugs resembling feed', async () => {
+    const message =
+      "Tiêu đề này tạo đường dẫn bài viết 'feed' đã được dành riêng; vui lòng chọn tiêu đề khác";
+    const response = await post(input({ title: 'Feed' }))
+      .set('x-lang', 'vi')
+      .expect(400);
+    expect(response.body.message).toBe(message);
+    const article = await create({ title: 'Feed news' });
+    expect(article.slug).toBe('feed-news');
+    expect((await get(article.slug).expect(200)).body.article).toEqual(article);
+    expect(
+      (
+        await mutate('put', article.slug, { title: 'Feed' })
+          .set('x-lang', 'vi')
+          .expect(400)
+      ).body.message,
+    ).toBe(message);
+    const updated = await mutate('put', article.slug, {
+      title: 'Feed archive',
+    }).expect(200);
+    expect(updated.body.article.slug).toBe('feed-archive');
+    expect((await get('feed-archive').expect(200)).body).toEqual(updated.body);
+  });
+
   it.each([
     'post',
     'get',
@@ -1491,7 +1541,9 @@ describe('Article APIs (e2e)', () => {
     });
 
     it('requires authentication and matches the static route even when an article has slug feed', async () => {
-      await create({ title: 'feed' });
+      // Simulate a legacy/directly inserted row: new API writes reject feed.
+      const legacy = await create();
+      await articles.update({ slug: legacy.slug }, { slug: 'feed' });
       const ordinary = await create();
       await feed().expect(401);
       expect((await currentFeed().expect(200)).body).toEqual({
@@ -1505,6 +1557,12 @@ describe('Article APIs (e2e)', () => {
         (await list({ author: author.username }).expect(200)).body
           .articlesCount,
       ).toBe(2);
+      const repaired = await mutate('put', 'feed', {
+        title: `Repaired ${prefix}`,
+      }).expect(200);
+      expect((await get(repaired.body.article.slug).expect(200)).body).toEqual(
+        repaired.body,
+      );
     });
 
     it('ignores a forged viewer in a GET body and rejects viewer query parameters', async () => {

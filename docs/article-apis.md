@@ -1,4 +1,4 @@
-# PR4 article APIs: Commits 2–6
+# PR4 article APIs: Commits 2–7
 
 Commit 2 adds `POST /api/articles` and `GET /api/articles/:slug`. Commit 3 adds
 `PUT /api/articles/:slug` and `DELETE /api/articles/:slug`. Commit 4 adds
@@ -6,8 +6,29 @@ Commit 2 adds `POST /api/articles` and `GET /api/articles/:slug`. Commit 3 adds
 `GET /api/articles/feed`. Commit 6 adds
 `POST /api/articles/:slug/favorite` and `DELETE /api/articles/:slug/favorite`. Schema,
 migrations, `synchronize: false`, and the existing authentication implementation
-remain unchanged. The request and single-article response follow the
+remain unchanged. Commit 7 reviews the full PR and reserves the conflicting
+`feed` slug during generation. The request and successful single-article response follow the
 [RealWorld contract](https://realworld-docs.netlify.app/specifications/backend/endpoints/).
+
+## Explicit project policies versus RealWorld
+
+This project preserves its existing `Authorization: Bearer <JWT>` convention;
+RealWorld examples use `Authorization: Token <JWT>`. Validation returns Nest's
+400 response with `statusCode`, `message` and `error`, rather than RealWorld's
+[422 and errors.body format](https://realworld-docs.netlify.app/specifications/backend/error-handling/).
+These established PR2/PR3 choices are regression-tested and are not silently
+changed by this review. Get/List allow anonymous access, but supplied invalid
+credentials are always rejected.
+
+Other explicit policies include the limit of 100, safe integer offsets, empty
+and unknown query rejection, Unicode/tag normalization and input size bounds,
+deterministic unsuffixed slugs with 409 collisions, rejection of the reserved
+generated slug `feed` with 400, author-only mutations, unchanged-title slug
+stability, empty Update as a no-op, no tag updates, Delete returning 204,
+duplicate Favorite returning 409, and idempotent Unfavorite returning 200.
+The corresponding sections and unit/E2E tests define these choices. Single
+Article responses include body; List/Feed omit it under the current RealWorld
+multiple-article response contract.
 
 ## Input and ownership
 
@@ -36,6 +57,14 @@ hyphens, and outer hyphens removed. Letters and numbers from other scripts remai
 readable. Slugs are truncated at 255 Unicode code points without splitting a
 surrogate pair; trailing hyphens are removed again. A title containing only
 unsupported characters uses `article`.
+
+The generated slug `feed` is reserved for `GET /api/articles/feed`. Create and
+changed-title Update reject it with localized 400 `articles.RESERVED_SLUG`,
+before inserting an article or writing any Update fields. The check runs after
+slug normalization, so `feed`, `FEED`, `Fééd` and `ＦＥＥＤ` are all rejected.
+Other slugs such as `feed-news` remain valid. Rejected updates preserve body,
+tags, ownership and timestamps. This is a routing policy, not a database unique
+constraint or a change to the slug normalization utility.
 
 For example, `Đường đi!` and `DUONG DI` both become `duong-di`. There is no
 automatic numeric suffix: a slug already occupied under MySQL's collation
@@ -293,9 +322,12 @@ unchanged.
 
 The static Feed route is registered before `:slug`. An anonymous request to
 `/api/articles/feed` therefore returns 401 even if an Article with slug `feed`
-exists; authenticated requests use the feed handler. Creation and editing rules
-are unchanged, so this one static GET path takes precedence over single-article
-lookup for that slug. No additional slug values are reserved.
+exists; authenticated requests use the feed handler. New Create/changed-title
+Update requests cannot generate this conflicting slug after the final review
+fix. A legacy or directly inserted row with slug `feed` remains shadowed on GET;
+the owner can rename it using `PUT /api/articles/feed` with a different title,
+then retrieve the returned new slug. No existing data is renamed automatically,
+and no additional slug values are reserved.
 
 Count, page and metadata retain List's separate-read consistency limitation.
 A concurrent unfollow can change the count/page or following metadata between
@@ -437,6 +469,101 @@ before metadata is read. No snapshot guarantee across follow/tag reads is added.
 List/Feed retain their previously documented separate-read limitations.
 
 ## Verification
+
+### Final review scope and outstanding dependency risk (Commit 7)
+
+The review compares all six PR4 commits with `feat/user-profile`, including
+database foundation, Create/Get, Update/Delete, List, Feed and Favorites. The
+confirmed routing defect was an API-created slug `feed` becoming unreachable
+through Single Article GET. Focused regression tests first reproduced the
+missing rejection, then passed with the service check. HTTP tests cover Create,
+atomic Update rejection, English/Vietnamese messages, allowed neighboring
+slugs, static-route precedence for a legacy row, and owner-initiated repair.
+No unrelated functionality, dependency updates, schema changes or historical
+migration edits are part of this checkpoint.
+
+Review checks cover required/optional JWTs and Redis fail-closed behavior;
+principal-derived ownership/favorite identity; scoped updates/deletes; public
+DTO allowlists; parameterized SQL; UTF-8 TEXT byte limits and Unicode bounds;
+pure mappers and bounded real SQL counts; and short transactions using their
+own EntityManager. READ COMMITTED is not described as an immutable snapshot.
+The database E2E suite checks real uniqueness, foreign keys, cascades, index
+metadata and reversible migration down/up/rerun while hashing PR2/PR3 rows and
+schemas to verify preservation. Destructive migration checks refuse nonempty
+Article tables and run only on the isolated test database.
+
+Dependency audits on 2026-11-21 both completed and returned nonzero because
+moderate advisories remain:
+
+- `npm audit --omit=dev`: 3 moderate affected packages (`typeorm`, its `glob`
+  dependency, and `minimatch`); zero high/critical findings.
+- `npm audit`: 19 moderate affected packages, including the development Jest
+  dependency chain; zero high/critical findings. These are propagated package
+  findings, not 19 distinct underlying advisories.
+- Underlying advisories are
+  [glob AbortSignal cancellation bypass](https://github.com/advisories/GHSA-3g3m-2fjr-6pw4)
+  and [minimatch globparts amplification](https://github.com/advisories/GHSA-g3hv-75wg-m249).
+  The production chain is inherited from the unchanged base dependency files.
+- npm suggests a major TypeORM upgrade and a Jest major downgrade. Neither is
+  applied in this review; no `audit fix --force` is used. Dependency audit
+  remains **FAIL** until separately remediated or explicitly accepted.
+
+Source inspection found TypeORM's entity/migration glob patterns are controlled
+by application configuration, not Article request fields. This limits the
+observed HTTP exposure of these denial-of-service advisories, but is not proof
+that the installed dependencies are vulnerability-free. Package/lock direct
+dependency declarations match, `npm ls --depth=0` succeeds, and the existing
+inquirer/undici overrides resolve correctly. No package or lockfile changes
+were needed. Production telemetry and production-scale performance are **NOT
+VERIFIED**; this review uses isolated test services only. Existing deep-offset,
+separate-read and concurrent metadata limitations above still apply.
+
+### Final checkpoint results
+
+Reviewed against `feat/user-profile` with Node.js 26.13.0 on 2026-11-21.
+The following PASS results refer to the project contract, including the
+explicit RealWorld differences above:
+
+- **PASS:** POST `/api/articles`: required JWT, principal author, 201 Single Article.
+- **PASS:** GET `/api/articles`: optional JWT, filters/pagination, 200 collection.
+- **PASS:** GET `/api/articles/feed`: required JWT, followed-author membership,
+  200 collection and static-route precedence.
+- **PASS:** GET `/api/articles/:slug`: optional JWT, 200 Single Article or 404.
+- **PASS:** PUT `/api/articles/:slug`: required JWT and author ownership,
+  validated partial update, reserved-slug protection and 200 Single Article.
+- **PASS:** DELETE `/api/articles/:slug`: required JWT and author ownership,
+  204 with cascades, repeated deletion 404.
+- **PASS:** POST `/api/articles/:slug/favorite`: required JWT, current viewer
+  only, 200 Single Article or specific duplicate 409.
+- **PASS:** DELETE `/api/articles/:slug/favorite`: required JWT, scoped
+  idempotent removal, 200 Single Article.
+- **PASS, mentor A:** Article-domain duplicate errors, sanitized unexpected
+  failures, preserved causes and appropriate logging.
+- **PASS, mentor B:** Create/Update 65,535-byte UTF-8 boundaries, multibyte/emoji
+  rejection above the boundary, other column bounds and Unicode/slug coverage.
+- **PASS, mentor C:** Query transformation helpers remain outside DTO classes,
+  shared and tested; malformed input is not coerced into defaults.
+- **PASS, mentor D:** Shared List/Feed pagination, defaults 20/0, maximum 100,
+  safe offsets and strict validation without a generic framework.
+- **PASS, mentor E:** Explicit empty results for missing filter users, including
+  correct totals and combined filters.
+- **PASS, mentor F:** Pure allowlist mappers, batch metadata and real SQL-count
+  assertions at page sizes 1 and 20; no List/Feed body projection or N+1 queries.
+- **PASS:** Security/ownership, real concurrent operations, transaction-manager
+  use, rollback/cascade integrity, isolated service safety and migration
+  down/up/rerun preservation checks.
+- **PASS:** Format, lint, build and `git diff --check`; full unit run
+  **266 tests / 17 suites**, full E2E run **423 tests / 9 suites**.
+  Focused routing runs passed **8 unit tests** and **6 HTTP tests**; the eight
+  new unit cases failed before the fix, confirming the regression.
+- **FAIL:** Dependency audit remains non-clean (3 production / 19 total
+  moderate affected packages, zero high/critical); details above.
+- **NOT VERIFIED:** Production telemetry and production-scale load behavior.
+
+PR4 is ready for manual/PR review with the reserved-slug fix and outstanding
+dependency risk explicitly flagged. No claim of a clean dependency audit or
+cross-statement immutable READ COMMITTED snapshot is made. Git changes are left
+unstaged for the owner's review and manual commit.
 
 Unit tests cover validation, Unicode/byte boundaries, slug normalization and
 collisions, pure mapping, transaction manager use, bounded deadlock retries,

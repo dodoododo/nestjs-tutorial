@@ -99,6 +99,36 @@ describe('ArticlesService', () => {
 
   afterEach(() => jest.restoreAllMocks());
 
+  describe.each(['feed', 'FEED', 'Fééd', 'ＦＥＥＤ'])(
+    'reserved feed slug generated from %j',
+    (title) => {
+      it('rejects creation before starting a transaction', async () => {
+        await expect(
+          service.createArticle({ ...dto, title }, 'author'),
+        ).rejects.toMatchObject({
+          status: 400,
+          message: 'articles.RESERVED_SLUG',
+        });
+        expect(transaction).not.toHaveBeenCalled();
+        expect(manager.insert).not.toHaveBeenCalled();
+      });
+      it('rejects a title update before writing any supplied fields', async () => {
+        await expect(
+          service.updateArticle(
+            'title',
+            { title, body: 'Must not persist' },
+            'author',
+          ),
+        ).rejects.toMatchObject({
+          status: 400,
+          message: 'articles.RESERVED_SLUG',
+        });
+        expect(manager.update).not.toHaveBeenCalled();
+        expect(manager.existsBy).not.toHaveBeenCalled();
+      });
+    },
+  );
+
   describe('listArticles', () => {
     it('maps a batch by stable IDs, omits body and selects only public columns', async () => {
       qb.getRawAndEntities.mockResolvedValueOnce({

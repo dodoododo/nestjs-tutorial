@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   ConflictException,
   ForbiddenException,
   Injectable,
@@ -83,6 +84,7 @@ export class ArticlesService {
     authorId: string,
   ): Promise<ArticleResponseDto> {
     const slug = articleSlug(dto.title);
+    this.assertRoutableSlug(slug);
     const names = [...new Set((dto.tagList ?? []).map(normalizeTag))].sort();
     for (let attempt = 1; ; attempt++) {
       try {
@@ -345,6 +347,7 @@ export class ArticlesService {
       if (dto.title !== undefined && dto.title !== article.title) {
         changes.title = dto.title;
         changes.slug = articleSlug(dto.title);
+        this.assertRoutableSlug(changes.slug);
         if (
           changes.slug !== article.slug &&
           (await manager.existsBy(Article, {
@@ -372,6 +375,13 @@ export class ArticlesService {
       // Existing foreign keys cascade links/favorites; reusable tags survive.
       await manager.delete(Article, { id: article.id, authorId });
     });
+  }
+
+  private assertRoutableSlug(slug: string): void {
+    // GET /articles/feed is a static route, so it cannot address an article.
+    if (slug === 'feed') {
+      throw new BadRequestException(this.i18n.t('articles.RESERVED_SLUG'));
+    }
   }
 
   favoriteArticle(slug: string, userId: string): Promise<ArticleResponseDto> {

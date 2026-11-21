@@ -2,6 +2,7 @@
   "NOT_FOUND": "Không tìm thấy bài viết",
   "NOT_AUTHOR": "Chỉ tác giả mới có thể sửa hoặc xóa bài viết này",
   "SLUG_CONFLICT": "Đã có bài viết với tiêu đề tương đương; vui lòng chọn tiêu đề khác",
+  "RESERVED_SLUG": "Tiêu đề này tạo đường dẫn bài viết 'feed' đã được dành riêng; vui lòng chọn tiêu đề khác",
   "ALREADY_FAVORITED": "Bạn đã yêu thích bài viết này",
   "PERSISTENCE_FAILED": "Không thể lưu hoặc truy xuất bài viết"
 }
