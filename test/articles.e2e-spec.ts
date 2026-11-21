@@ -2078,7 +2078,7 @@ describe('Article APIs (e2e)', () => {
     });
   });
 
-  it('documents only the eight article operations and their DTOs', async () => {
+  it('documents article operations and their DTOs alongside comment creation', async () => {
     const response = await request(app.getHttpServer())
       .get('/docs-json')
       .expect(200);
@@ -2091,6 +2091,7 @@ describe('Article APIs (e2e)', () => {
       '/api/articles/feed',
       '/api/articles/{slug}',
       '/api/articles/{slug}/favorite',
+      '/api/articles/{slug}/comments',
     ]);
     const favoritePath = response.body.paths['/api/articles/{slug}/favorite'];
     expect(Object.keys(favoritePath).sort()).toEqual(['delete', 'post']);
