@@ -18,10 +18,14 @@ import { INVALID_USER_PASSWORD_HASH } from '../src/auth/constants/auth.constant'
 import { CommentResponseDto } from '../src/comments/dto/comment-response.dto';
 import { CommentsResponseDto } from '../src/comments/dto/comments-response.dto';
 import { COMMENT_BODY_MAX_BYTES } from '../src/comments/constants/comment.constant';
+import { CommentsService } from '../src/comments/comments.service';
 import { Article } from '../src/database/entities/article.entity';
 import { Comment } from '../src/database/entities/comment.entity';
 import { User } from '../src/database/entities/user.entity';
 import { Follow } from '../src/database/entities/follow.entity';
+import { Tag } from '../src/database/entities/tag.entity';
+import { ArticleTag } from '../src/database/entities/article-tag.entity';
+import { ArticleFavorite } from '../src/database/entities/article-favorite.entity';
 import {
   REDIS_CLIENT,
   REVOCATION_KEY_PREFIX,
@@ -42,6 +46,7 @@ describe('Comment APIs (e2e)', () => {
   let token: string;
   const userIds: string[] = [];
   const revocationKeys: string[] = [];
+  const tagIds: string[] = [];
 
   function post(
     payload: unknown = {
@@ -57,6 +62,18 @@ describe('Comment APIs (e2e)', () => {
     return req.send(payload as object);
   }
   const ownCount = () => comments.countBy({ authorId: In(userIds) });
+
+  function remove(
+    id: string,
+    authorization: string | null = `Bearer ${token}`,
+    slug = article.slug,
+  ) {
+    const req = request(app.getHttpServer()).delete(
+      `/api/articles/${encodeURIComponent(slug)}/comments/${encodeURIComponent(id)}`,
+    );
+    if (authorization !== null) req.set('Authorization', authorization);
+    return req;
+  }
 
   function get(authorization?: string, slug = article.slug) {
     const req = request(app.getHttpServer()).get(
@@ -151,6 +168,8 @@ describe('Comment APIs (e2e)', () => {
   afterEach(async () => {
     jest.restoreAllMocks();
     if (userIds.length) await users.delete({ id: In(userIds.splice(0)) });
+    if (tagIds.length)
+      await dataSource.getRepository(Tag).delete({ id: In(tagIds.splice(0)) });
     if (revocationKeys.length) await redis.del(...revocationKeys.splice(0));
   });
   afterAll(async () => {
@@ -792,7 +811,361 @@ describe('Comment APIs (e2e)', () => {
     });
   });
 
-  it('documents implemented POST and GET routes with shared Comment DTOs and optional GET auth', async () => {
+  describe('DELETE Comment', () => {
+    async function createTarget() {
+      return comments.save({
+        articleId: article.id,
+        authorId: commenter.id,
+        body: 'Author-owned comment',
+      });
+    }
+
+    it('returns empty 204 and preserves parents, unrelated Comments, Article content/tags/favorites and Follow metadata', async () => {
+      const target = await createTarget();
+      const retained = await comments.save({
+        articleId: article.id,
+        authorId: owner.id,
+        body: 'Retained same-article comment',
+      });
+      const otherComment = await comments.save({
+        articleId: unrelated.id,
+        authorId: commenter.id,
+        body: 'Retained unrelated comment',
+      });
+      const tag = await dataSource
+        .getRepository(Tag)
+        .save({ name: `delete-${randomUUID()}` });
+      tagIds.push(tag.id);
+      await dataSource
+        .getRepository(ArticleTag)
+        .insert({ articleId: article.id, tagId: tag.id });
+      await dataSource
+        .getRepository(ArticleFavorite)
+        .insert({ articleId: article.id, userId: commenter.id });
+      await dataSource
+        .getRepository(Follow)
+        .insert({ followerId: commenter.id, followingId: owner.id });
+      const before = await request(app.getHttpServer())
+        .get(`/api/articles/${article.slug}`)
+        .set('Authorization', `Bearer ${token}`)
+        .expect(200);
+      const response = await remove(target.id).expect(204);
+      expect(response.text).toBe('');
+      expect(response.headers['content-type']).toBeUndefined();
+      expect(await comments.existsBy({ id: target.id })).toBe(false);
+      expect(await comments.findOneByOrFail({ id: retained.id })).toEqual(
+        retained,
+      );
+      expect(await comments.findOneByOrFail({ id: otherComment.id })).toEqual(
+        otherComment,
+      );
+      const listed = await get().expect(200);
+      expect(listed.headers['cache-control']).toBe('private, no-store');
+      expect(
+        (listed.body as CommentsResponseDto).comments.map(
+          (comment) => comment.id,
+        ),
+      ).toEqual([retained.id]);
+      const after = await request(app.getHttpServer())
+        .get(`/api/articles/${article.slug}`)
+        .set('Authorization', `Bearer ${token}`)
+        .expect(200);
+      expect(after.body).toEqual(before.body);
+      expect(await articles.findOneByOrFail({ id: article.id })).toEqual(
+        article,
+      );
+      expect(await articles.findOneByOrFail({ id: unrelated.id })).toEqual(
+        unrelated,
+      );
+      expect(await users.countBy({ id: In(userIds) })).toBe(2);
+      expect(
+        await dataSource
+          .getRepository(ArticleTag)
+          .existsBy({ articleId: article.id, tagId: tag.id }),
+      ).toBe(true);
+      expect(
+        await dataSource
+          .getRepository(ArticleFavorite)
+          .existsBy({ articleId: article.id, userId: commenter.id }),
+      ).toBe(true);
+      expect(
+        await dataSource
+          .getRepository(Follow)
+          .existsBy({ followerId: commenter.id, followingId: owner.id }),
+      ).toBe(true);
+      await request(app.getHttpServer())
+        .get(`/api/profiles/${commenter.username}`)
+        .expect(200);
+    });
+
+    it.each(['Article author', 'unrelated user'])(
+      "rejects %s deleting another author's Comment with 403",
+      async (kind) => {
+        const target = await createTarget();
+        let viewerId = owner.id;
+        if (kind === 'unrelated user') {
+          viewerId = randomUUID();
+          userIds.push(viewerId);
+          await users.insert({
+            id: viewerId,
+            username: `c_${viewerId}`,
+            email: `c_${viewerId}@example.test`,
+            passwordHash: INVALID_USER_PASSWORD_HASH,
+          });
+        }
+        const credential = await app
+          .get(JwtService)
+          .signAsync({ sub: viewerId, jti: randomUUID() });
+        const log = jest
+          .spyOn(Logger.prototype, 'error')
+          .mockImplementation(() => undefined);
+        const response = await remove(target.id, `Bearer ${credential}`).expect(
+          403,
+        );
+        expect(response.body.message).toBe(
+          'Only the comment author may delete this comment',
+        );
+        expect(await comments.findOneByOrFail({ id: target.id })).toEqual(
+          target,
+        );
+        expect(log).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([true, false])(
+      'returns 404 for cross-Article IDs before authorization (Comment author=%s)',
+      async (isAuthor) => {
+        const target = await comments.save({
+          articleId: unrelated.id,
+          authorId: commenter.id,
+          body: 'Other Article',
+        });
+        const credential = isAuthor
+          ? token
+          : await app
+              .get(JwtService)
+              .signAsync({ sub: owner.id, jti: randomUUID() });
+        await remove(target.id, `Bearer ${credential}`).expect(404);
+        expect(await comments.findOneByOrFail({ id: target.id })).toEqual(
+          target,
+        );
+      },
+    );
+
+    it('returns 404 for an unknown Article or valid nonexistent Comment UUID without mutations', async () => {
+      const target = await createTarget();
+      await remove(target.id, undefined, `missing-${randomUUID()}`).expect(404);
+      const response = await remove(randomUUID()).expect(404);
+      expect(response.body.message).toBe('Comment not found in this article');
+      expect(await comments.findOneByOrFail({ id: target.id })).toEqual(target);
+    });
+
+    it('uses the current slug and returns 404 on repeated deletion', async () => {
+      const target = await createTarget();
+      const newSlug = `renamed-${randomUUID()}`;
+      await articles.update(article.id, { slug: newSlug });
+      await remove(target.id).expect(404);
+      await remove(target.id, undefined, newSlug).expect(204);
+      await remove(target.id, undefined, newSlug).expect(404);
+    });
+
+    it.each([
+      'not-a-uuid',
+      '123',
+      '00000000-0000-4000-8000-00000000000Z',
+      "' OR 1=1 --",
+    ])(
+      'rejects malformed UUIDs without invoking deletion (case %#)',
+      async (id) => {
+        const target = await createTarget();
+        const operation = jest.spyOn(app.get(CommentsService), 'deleteComment');
+        await remove(id).expect(400);
+        expect(operation).not.toHaveBeenCalled();
+        expect(await comments.findOneByOrFail({ id: target.id })).toEqual(
+          target,
+        );
+      },
+    );
+
+    it('ignores body/query ownership fields and uses only the path and JWT principal, matching Delete Article', async () => {
+      const target = await createTarget();
+      const retained = await comments.save({
+        articleId: article.id,
+        authorId: owner.id,
+        body: 'Retained',
+      });
+      const ownerToken = await app
+        .get(JwtService)
+        .signAsync({ sub: owner.id, jti: randomUUID() });
+      await remove(target.id, `Bearer ${ownerToken}`)
+        .query({ authorId: commenter.id, viewerId: commenter.id })
+        .send({ authorId: commenter.id })
+        .expect(403);
+      await remove(target.id)
+        .query({ id: retained.id, articleId: unrelated.id, authorId: owner.id })
+        .send({
+          commentId: retained.id,
+          articleId: unrelated.id,
+          authorId: owner.id,
+        })
+        .expect(204);
+      expect(await comments.existsBy({ id: target.id })).toBe(false);
+      expect(await comments.findOneByOrFail({ id: retained.id })).toEqual(
+        retained,
+      );
+    });
+
+    it.each([
+      null,
+      '',
+      'Bearer',
+      'Basic credentials',
+      'Bearer invalid.jwt.token',
+    ])(
+      'rejects missing/invalid credentials before reaching deletion (case %#)',
+      async (credential) => {
+        const target = await createTarget();
+        const operation = jest.spyOn(app.get(CommentsService), 'deleteComment');
+        await remove(target.id, credential).expect(401);
+        expect(operation).not.toHaveBeenCalled();
+        expect(await comments.findOneByOrFail({ id: target.id })).toEqual(
+          target,
+        );
+      },
+    );
+
+    it.each(['expired', 'incorrect signature', 'revoked'])(
+      'rejects %s JWTs without deleting',
+      async (kind) => {
+        const target = await createTarget();
+        const jwt = app.get(JwtService);
+        let credential = token;
+        if (kind === 'expired')
+          credential = await jwt.signAsync(
+            { sub: commenter.id, jti: randomUUID() },
+            { expiresIn: -1 },
+          );
+        if (kind === 'incorrect signature')
+          credential = await jwt.signAsync(
+            { sub: commenter.id, jti: randomUUID() },
+            { secret: 'different-secret-with-at-least-32-bytes' },
+          );
+        if (kind === 'revoked') {
+          const { jti } = await jwt.verifyAsync<{ jti: string }>(token);
+          revocationKeys.push(`${REVOCATION_KEY_PREFIX}${jti}`);
+          await request(app.getHttpServer())
+            .post('/api/logout')
+            .set('Authorization', `Bearer ${token}`)
+            .expect(204);
+        }
+        const operation = jest.spyOn(app.get(CommentsService), 'deleteComment');
+        await remove(target.id, `Bearer ${credential}`).expect(401);
+        expect(operation).not.toHaveBeenCalled();
+        expect(await comments.findOneByOrFail({ id: target.id })).toEqual(
+          target,
+        );
+      },
+    );
+
+    it('fails closed with Redis unavailable before UUID validation or deletion', async () => {
+      const target = await createTarget();
+      const operation = jest.spyOn(app.get(CommentsService), 'deleteComment');
+      const check = jest
+        .spyOn(redis, 'get')
+        .mockRejectedValue(new Error('Connection unavailable'));
+      jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+      await remove('malformed', null).expect(401);
+      expect(check).not.toHaveBeenCalled();
+      await remove(target.id).expect(503);
+      expect(operation).not.toHaveBeenCalled();
+      expect(await comments.findOneByOrFail({ id: target.id })).toEqual(target);
+    });
+
+    it('handles concurrent duplicate deletion as one 204 and one 404 without changing unrelated Comments', async () => {
+      const target = await createTarget();
+      const retained = await comments.save({
+        articleId: article.id,
+        authorId: owner.id,
+        body: 'Retained',
+      });
+      const responses = await Promise.all([
+        remove(target.id),
+        remove(target.id),
+      ]);
+      expect(
+        responses
+          .map((response) => response.status)
+          .sort((left, right) => left - right),
+      ).toEqual([204, 404]);
+      expect(await comments.existsBy({ id: target.id })).toBe(false);
+      expect(await comments.findOneByOrFail({ id: retained.id })).toEqual(
+        retained,
+      );
+      expect(await articles.existsBy({ id: article.id })).toBe(true);
+    });
+
+    it.each(['en', 'vi'])(
+      'logs and sanitizes unexpected DELETE errors (%s)',
+      async (lang) => {
+        const target = await createTarget();
+        const cause = new QueryFailedError(
+          'private SQL',
+          ['private body'],
+          Object.assign(new Error('private driver content'), {
+            code: 'ER_BAD_FIELD_ERROR',
+          }),
+        );
+        jest.spyOn(dataSource.manager, 'delete').mockRejectedValueOnce(cause);
+        const log = jest
+          .spyOn(Logger.prototype, 'error')
+          .mockImplementation(() => undefined);
+        const response = await remove(target.id).query({ lang }).expect(500);
+        expect(response.body.message).toBe(
+          lang === 'vi'
+            ? 'Không thể xóa bình luận'
+            : 'Unable to delete the comment',
+        );
+        expect(JSON.stringify(response.body)).not.toMatch(
+          /SQL|private|stack|query|password|token|path/i,
+        );
+        expect(log).toHaveBeenCalledWith('Comment deletion failed', {
+          errorType: 'QueryFailedError',
+          code: 'ER_BAD_FIELD_ERROR',
+        });
+        expect(JSON.stringify(log.mock.calls)).not.toMatch(
+          /SQL|private|body|password|token/i,
+        );
+        expect(await comments.findOneByOrFail({ id: target.id })).toEqual(
+          target,
+        );
+      },
+    );
+
+    it('localizes expected 403 and 404 errors without logging failures', async () => {
+      const target = await createTarget();
+      const credential = await app
+        .get(JwtService)
+        .signAsync({ sub: owner.id, jti: randomUUID() });
+      const log = jest
+        .spyOn(Logger.prototype, 'error')
+        .mockImplementation(() => undefined);
+      const forbidden = await remove(target.id, `Bearer ${credential}`)
+        .query({ lang: 'vi' })
+        .expect(403);
+      expect(forbidden.body.message).toBe(
+        'Chỉ tác giả bình luận mới có thể xóa bình luận này',
+      );
+      const missing = await remove(randomUUID())
+        .query({ lang: 'vi' })
+        .expect(404);
+      expect(missing.body.message).toBe(
+        'Không tìm thấy bình luận trong bài viết này',
+      );
+      expect(log).not.toHaveBeenCalled();
+    });
+  });
+
+  it('documents implemented Comment operations with shared DTOs and optional GET auth', async () => {
     const response = await request(app.getHttpServer())
       .get('/docs-json')
       .expect(200);
@@ -801,6 +1174,30 @@ describe('Comment APIs (e2e)', () => {
     expect(path.post).toBeDefined();
     expect(path.get).toBeDefined();
     expect(path.delete).toBeUndefined();
+    const deletion =
+      document.paths['/api/articles/{slug}/comments/{id}'].delete!;
+    expect(deletion.security).toEqual([{ bearer: [] }]);
+    expect(Object.keys(deletion.responses).sort()).toEqual([
+      '204',
+      '400',
+      '401',
+      '403',
+      '404',
+      '500',
+      '503',
+    ]);
+    expect(deletion.responses['204'].content).toBeUndefined();
+    expect(deletion.parameters).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: 'slug', in: 'path', required: true }),
+        expect.objectContaining({
+          name: 'id',
+          in: 'path',
+          required: true,
+          schema: expect.objectContaining({ format: 'uuid' }),
+        }),
+      ]),
+    );
     expect(path.post!.security).toEqual([{ bearer: [] }]);
     expect(path.get!.security).toEqual([{}, { bearer: [] }]);
     expect(Object.keys(path.get!.responses).sort()).toEqual([

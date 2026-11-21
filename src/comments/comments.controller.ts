@@ -1,11 +1,13 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   Header,
   HttpCode,
   HttpStatus,
   Param,
+  ParseUUIDPipe,
   Post,
   UseGuards,
   UsePipes,
@@ -16,8 +18,10 @@ import {
   ApiBearerAuth,
   ApiBody,
   ApiCreatedResponse,
+  ApiForbiddenResponse,
   ApiInternalServerErrorResponse,
   ApiNotFoundResponse,
+  ApiNoContentResponse,
   ApiOperation,
   ApiOkResponse,
   ApiParam,
@@ -38,6 +42,48 @@ import { CommentsResponseDto } from './dto/comments-response.dto';
 @Controller('articles/:slug/comments')
 export class CommentsController {
   constructor(private readonly comments: CommentsService) {}
+
+  @Delete(':id')
+  @UseGuards(JwtAuthGuard)
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Delete your own comment',
+    description:
+      'Returns 204 with no body. Article ownership does not grant Comment deletion rights. Repeated or cross-article deletion returns 404.',
+  })
+  @ApiParam({ name: 'slug', description: 'Current article slug', type: String })
+  @ApiParam({
+    name: 'id',
+    description: 'Comment UUID',
+    type: String,
+    format: 'uuid',
+  })
+  @ApiNoContentResponse({ description: 'Comment deleted' })
+  @ApiBadRequestResponse({ description: 'Malformed Comment UUID' })
+  @ApiUnauthorizedResponse({
+    description: 'Missing, invalid, expired or revoked JWT',
+  })
+  @ApiForbiddenResponse({
+    description: 'Only the Comment author may delete it',
+  })
+  @ApiNotFoundResponse({
+    description:
+      'Article or Comment not found in this Article, including repeated deletion',
+  })
+  @ApiServiceUnavailableResponse({
+    description: 'JWT revocation check unavailable',
+  })
+  @ApiInternalServerErrorResponse({
+    description: 'Unable to delete the comment',
+  })
+  delete(
+    @Param('slug') slug: string,
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() principal: AuthenticatedPrincipal,
+  ): Promise<void> {
+    return this.comments.deleteComment(slug, id, principal.user.id);
+  }
 
   @Get()
   @Header('Cache-Control', 'private, no-store')

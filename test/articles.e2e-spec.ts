@@ -2078,21 +2078,24 @@ describe('Article APIs (e2e)', () => {
     });
   });
 
-  it('documents article operations and their DTOs alongside comment creation', async () => {
+  it('documents article operations and their DTOs alongside Comment APIs', async () => {
     const response = await request(app.getHttpServer())
       .get('/docs-json')
       .expect(200);
     expect(
-      Object.keys(response.body.paths).filter((path) =>
-        path.startsWith('/api/articles'),
-      ),
-    ).toEqual([
-      '/api/articles',
-      '/api/articles/feed',
-      '/api/articles/{slug}',
-      '/api/articles/{slug}/favorite',
-      '/api/articles/{slug}/comments',
-    ]);
+      Object.keys(response.body.paths)
+        .filter((path) => path.startsWith('/api/articles'))
+        .sort(),
+    ).toEqual(
+      [
+        '/api/articles',
+        '/api/articles/feed',
+        '/api/articles/{slug}',
+        '/api/articles/{slug}/favorite',
+        '/api/articles/{slug}/comments',
+        '/api/articles/{slug}/comments/{id}',
+      ].sort(),
+    );
     const favoritePath = response.body.paths['/api/articles/{slug}/favorite'];
     expect(Object.keys(favoritePath).sort()).toEqual(['delete', 'post']);
     for (const method of ['post', 'delete']) {

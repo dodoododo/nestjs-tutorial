@@ -1,5 +1,6 @@
 import {
   Injectable,
+  ForbiddenException,
   InternalServerErrorException,
   Logger,
   NotFoundException,
@@ -33,6 +34,40 @@ export class CommentsService {
     private readonly dataSource: DataSource,
     private readonly i18n: I18nService,
   ) {}
+
+  async deleteComment(
+    slug: string,
+    id: string,
+    currentUserId: string,
+  ): Promise<void> {
+    const manager = this.dataSource.manager;
+    try {
+      const article = await manager.findOne(Article, {
+        where: { slug },
+        select: { id: true },
+      });
+      if (!article)
+        throw new NotFoundException(this.i18n.t('comments.ARTICLE_NOT_FOUND'));
+      // Resolve membership before ownership; unrelated IDs always yield 404.
+      const comment = await manager.findOne(Comment, {
+        where: { id, articleId: article.id },
+        select: { id: true, authorId: true },
+      });
+      if (!comment)
+        throw new NotFoundException(this.i18n.t('comments.NOT_FOUND'));
+      if (comment.authorId !== currentUserId)
+        throw new ForbiddenException(this.i18n.t('comments.NOT_AUTHOR'));
+      const result = await manager.delete(Comment, {
+        id: comment.id,
+        articleId: article.id,
+        authorId: currentUserId,
+      });
+      if (result.affected !== 1)
+        throw new NotFoundException(this.i18n.t('comments.NOT_FOUND'));
+    } catch (error: unknown) {
+      this.handlePersistenceError(error, 'deletion');
+    }
+  }
 
   async getComments(
     slug: string,
@@ -140,10 +175,11 @@ export class CommentsService {
 
   private handlePersistenceError(
     error: unknown,
-    operation: 'creation' | 'retrieval',
+    operation: 'creation' | 'retrieval' | 'deletion',
   ): never {
     if (
       error instanceof NotFoundException ||
+      error instanceof ForbiddenException ||
       error instanceof UnauthorizedException
     )
       throw error;
@@ -163,9 +199,11 @@ export class CommentsService {
     });
     throw new InternalServerErrorException(
       this.i18n.t(
-        operation === 'creation'
-          ? 'comments.PERSISTENCE_FAILED'
-          : 'comments.RETRIEVAL_FAILED',
+        {
+          creation: 'comments.PERSISTENCE_FAILED',
+          retrieval: 'comments.RETRIEVAL_FAILED',
+          deletion: 'comments.DELETION_FAILED',
+        }[operation],
       ),
       { cause: error },
     );

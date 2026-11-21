@@ -1,11 +1,11 @@
-# PR5 Comment APIs: Commits 2–3
+# PR5 Comment APIs: Commits 2–4
 
 Commit 2 implements `POST /api/articles/:slug/comments`. Commit 3 adds
 `GET /api/articles/:slug/comments` with optional authentication and shared public
-profile mapping.
+profile mapping. Commit 4 adds author-only Comment deletion.
 The nested request and Single Comment response follow the
 [RealWorld Add Comment contract](https://realworld-docs.netlify.app/specifications/backend/endpoints/#add-comments-to-an-article).
-DELETE Comment and later features are not implemented.
+Update Comment, replies, likes and pagination are not implemented.
 
 ## Request and project conventions
 
@@ -170,6 +170,46 @@ small existing-style private error handler: safe Logger metadata, original cause
 attached server-side, and no raw SQL/request contents in logs or responses.
 Expected 404s are preserved without unexpected-error logging.
 
+## Delete Comment
+
+`DELETE /api/articles/:slug/comments/:id` requires the existing Bearer JWT guard.
+The successful response is **204 No Content**, with an empty body, matching the
+project's Delete Article convention. No exact deletion status is mandated by the
+[RealWorld Delete Comment contract](https://realworld-docs.netlify.app/specifications/backend/endpoints/#delete-comment).
+
+`ParseUUIDPipe` validates the Comment ID before the handler runs. Malformed IDs
+return 400; valid unmatched UUIDs return 404. Guards run first, so missing or
+invalid credentials return 401 even with malformed path input. Redis revocation
+failure remains fail-closed with 503 before the deletion service executes.
+
+The service resolves the current Article slug and selects only its UUID, then
+finds the Comment by **both ID and Article UUID**, selecting only Comment ID and
+author ID. Unknown Articles or Comments, including IDs from another Article,
+return 404. Membership is checked before ownership, so even the actual author
+gets 404 for an ID under another Article's slug. A different Comment author gets
+403; Article ownership grants no exception. The only ownership identity is
+`principal.user.id`. Body/query fields have no effect, following the existing
+Delete Article convention; they cannot select a different target or impersonate
+an author.
+
+After the explicit authorship check, one parameterized TypeORM DELETE is scoped
+by Comment ID, Article ID and principal author ID. Only `affected === 1` succeeds.
+Zero affected rows return 404, including a concurrent deletion after lookup.
+Repeated deletion also returns 404. Concurrent requests are not serialized; one
+successful deletion and one 404 are expected. No transaction, pessimistic lock,
+Article lock, retry framework or distributed lock is needed for one atomic
+DELETE of an immutable-author Comment. Only the intended Comment is removed;
+Article content/timestamps/tags/favorites, Users, Follows and other Comments stay
+intact. Existing schema, foreign keys and migrations are unchanged.
+
+Expected 403/404 errors are preserved without unexpected-error logging.
+Unexpected lookup/DELETE errors use the existing safe Logger metadata and
+server-side original cause, with a sanitized Comments-domain 500 response.
+English and Vietnamese messages cover Comment-not-found, not-author and deletion
+failure. Swagger documents slug/UUID parameters, required authentication and
+204/400/401/403/404/500/503 responses, with no content schema for 204.
+GET Comments retains `Cache-Control: private, no-store` and its existing batching.
+
 ## Authentication, races and errors
 
 - Missing, invalid, expired, incorrectly signed, revoked or deleted-user JWTs
@@ -197,7 +237,7 @@ messages and status conventions. Swagger at `/docs` (`/docs-json`) documents the
 POST operation, nested body, Bearer auth, slug, public response and
 201/400/401/404/500/503 statuses. GET documents optional authentication, the slug,
 ordering, no pagination, shared Multiple Comments response and
-200/401/404/500/503 statuses. DELETE is not documented as implemented.
+200/401/404/500/503 statuses. DELETE documents the author-only behavior above.
 
 ## Verification and limits
 
@@ -225,6 +265,70 @@ Redis failure, translated errors, a real Article-deletion foreign-key race and
 Swagger. Cleanup targets only test-created users/records and revocation keys.
 Run E2E suites serially because existing database tests roundtrip migrations.
 No development or production database is used.
+
+Commit 4 adds service and HTTP tests for author-only deletion, cross-Article 404s
+before ownership checks, invalid UUIDs, current-slug lookup, repeated deletion,
+zero affected rows, concurrent requests, auth/Redis failures, ignored forged
+ownership fields, localized/sanitized errors and preservation of related data.
+
+### SunLint quality gate (Commit 4)
+
+SunLint **1.3.56** is run through its already-installed official package CLI:
+
+```powershell
+$sunlintCli = 'D:\nestjs-npm-cache\_npx\d135427ecc649769\node_modules\@sun-asterisk\sunlint\cli.js'
+node $sunlintCli --version
+node $sunlintCli --all --input=src --format=json --output=node_modules/.cache/pr5-commit4-review/final-src.json --output-summary=node_modules/.cache/pr5-commit4-review/final-src-summary.json *> node_modules/.cache/pr5-commit4-review/final-src.log
+node $sunlintCli --all --input=test --format=json --output=node_modules/.cache/pr5-commit4-review/final-test.json --output-summary=node_modules/.cache/pr5-commit4-review/final-test-summary.json *> node_modules/.cache/pr5-commit4-review/final-test.log
+node $sunlintCli --all --input=src/comments/comments.service.spec.ts --config=node_modules/.cache/pr5-commit4-review/include-unit.json --format=json --output=node_modules/.cache/pr5-commit4-review/final-unit.json --output-summary=node_modules/.cache/pr5-commit4-review/final-unit-summary.json *> node_modules/.cache/pr5-commit4-review/final-unit.log
+```
+
+The temporary, ignored inclusion config sets
+`languages.typescript.include` to `["**/*.ts"]` and `exclude` to `["**/*.d.ts"]`.
+It disables no rules. The default source scan excludes `*.spec.ts`, so this
+explicit unit-file scan is necessary. Files are discovered from disk rather than
+Git's tracked-only diff, covering any untracked source/test files too. The final
+changed/untracked TypeScript inventory is checked separately against those
+inputs: CommentsController, CommentsService, its unit test, Comment E2E tests and
+the Article Swagger integration test (five changed TypeScript files; no untracked
+TypeScript files at completion). No application dependencies or ESLint configuration are added. The
+initial `npx` attempt was interrupted after making no progress; the cached
+official package was verified as exactly 1.3.56 and its supported CLI used instead.
+
+Baseline scans from committed Commit 3 produced 73 source files / 125 warnings,
+12 test files / 167 warnings, and the explicit service unit file / 0 warnings.
+All had zero errors and exit 0. Current scans produce 73 source files / 126
+warnings, 12 test files / 171 warnings, and the service unit file / 0 warnings,
+with zero errors and exit 0. Comparison normalizes paths and matches rule/message
+counts, then reviews locations against the actual code changes. Findings:
+
+- **One new S037 warning:** DELETE anti-cache heuristic. This mutation is not a
+  cacheable representation under [HTTP DELETE semantics](https://www.rfc-editor.org/rfc/rfc9110.html#section-9.3.5); it does not expose viewer-specific GET
+  metadata. The existing GET's `private, no-store` header remains verified.
+  Demands for legacy Pragma/Expires headers are not grounds to change this API.
+- **Four new test warnings:** C041 and S012 flag the intentional wrong-signature
+  test secret; two S042 warnings flag deliberately expired and wrong-signature
+  JWT fixtures. The expired fixture explicitly sets `expiresIn: -1`; other
+  signed fixtures inherit the validated JwtModule TTL. These are false positives,
+  not leaked production credentials or tokens lacking expiration.
+- **292 pre-existing warnings:** unchanged source/test findings, including
+  heuristic C018/C030 messages on the existing safe exception handler, Logger
+  construction and DataSource injection. Existing warnings are not globally
+  suppressed or claimed to be fully audited by this checkpoint.
+
+No new confirmed security/correctness defect or unresolved security issue was
+identified in the changed code. A new oxlint warning about sorting numeric
+response statuses was corrected with an explicit numeric comparator. SunLint
+scans are rerun afterward. Its default engine runs heuristics plus a limited
+ESLint rule and reports that full TypeScript ESLint support/configuration is
+unavailable. **Full TypeScript ESLint analysis is NOT VERIFIED**; successful CLI
+execution and zero reported errors do not imply complete static-analysis coverage.
+
+Final verification on Node.js 26.13.0: formatting, oxlint, build and
+`git diff --check` all exit 0. Focused CommentsService tests pass 38/38 and Comment
+E2E tests pass 112/112, each with exit 0. The full unit regression passes 367
+tests across 21 suites and full E2E regression passes 562 tests across 11 suites,
+both with exit 0 and no `--forceExit`. All three final SunLint scans exit 0.
 
 Commit 3 adds unit coverage for empty/unknown/scoped retrieval, SQL ordering,
 deduplicated batch following, anonymous metadata, fixed calls for repeated authors,

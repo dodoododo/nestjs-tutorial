@@ -1,5 +1,8 @@
 {
   "ARTICLE_NOT_FOUND": "Không tìm thấy bài viết cho bình luận này",
   "PERSISTENCE_FAILED": "Không thể tạo bình luận",
-  "RETRIEVAL_FAILED": "Không thể truy xuất bình luận"
+  "RETRIEVAL_FAILED": "Không thể truy xuất bình luận",
+  "NOT_FOUND": "Không tìm thấy bình luận trong bài viết này",
+  "NOT_AUTHOR": "Chỉ tác giả bình luận mới có thể xóa bình luận này",
+  "DELETION_FAILED": "Không thể xóa bình luận"
 }

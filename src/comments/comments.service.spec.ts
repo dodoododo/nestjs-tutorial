@@ -69,6 +69,7 @@ describe('CommentsService', () => {
     transaction: jest.fn(),
     createQueryBuilder: jest.fn(),
     find: jest.fn(),
+    delete: jest.fn(),
   };
   let service: CommentsService;
   let log: jest.SpyInstance;
@@ -89,6 +90,7 @@ describe('CommentsService', () => {
     );
     manager.save.mockResolvedValue(saved);
     manager.existsBy.mockResolvedValue(true);
+    manager.delete.mockResolvedValue({ affected: 1 });
     for (const method of [
       'innerJoin',
       'select',
@@ -109,6 +111,177 @@ describe('CommentsService', () => {
     );
   });
   afterEach(() => jest.restoreAllMocks());
+
+  describe('deleteComment', () => {
+    beforeEach(() => {
+      manager.findOne.mockImplementation((target: unknown) =>
+        Promise.resolve(target === Article ? article : saved),
+      );
+    });
+
+    it('deletes only the author-owned Comment within the resolved Article without transactions, locks or other writes', async () => {
+      await expect(
+        service.deleteComment(article.slug, saved.id, authorId),
+      ).resolves.toBeUndefined();
+      expect(manager.findOne.mock.calls).toEqual([
+        [Article, { where: { slug: article.slug }, select: { id: true } }],
+        [
+          Comment,
+          {
+            where: { id: saved.id, articleId: article.id },
+            select: { id: true, authorId: true },
+          },
+        ],
+      ]);
+      expect(manager.delete).toHaveBeenCalledTimes(1);
+      expect(manager.delete).toHaveBeenCalledWith(Comment, {
+        id: saved.id,
+        articleId: article.id,
+        authorId,
+      });
+      expect(manager.update).not.toHaveBeenCalled();
+      expect(manager.save).not.toHaveBeenCalled();
+      expect(manager.transaction).not.toHaveBeenCalled();
+      expect(manager.createQueryBuilder).not.toHaveBeenCalled();
+      expect(log).not.toHaveBeenCalled();
+    });
+
+    it.each(['different-user', article.authorId])(
+      'rejects non-author %s, including the Article author, with 403',
+      async (viewerId) => {
+        await expect(
+          service.deleteComment(article.slug, saved.id, viewerId),
+        ).rejects.toMatchObject({
+          status: 403,
+          message: 'comments.NOT_AUTHOR',
+        });
+        expect(manager.delete).not.toHaveBeenCalled();
+        expect(log).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([authorId, 'different-user'])(
+      'returns 404 for an out-of-Article ID before checking ownership for %s',
+      async (viewerId) => {
+        manager.findOne
+          .mockResolvedValueOnce(article)
+          .mockResolvedValueOnce(null);
+        await expect(
+          service.deleteComment(article.slug, saved.id, viewerId),
+        ).rejects.toMatchObject({ status: 404, message: 'comments.NOT_FOUND' });
+        expect(manager.findOne).toHaveBeenLastCalledWith(Comment, {
+          where: { id: saved.id, articleId: article.id },
+          select: { id: true, authorId: true },
+        });
+        expect(manager.delete).not.toHaveBeenCalled();
+        expect(log).not.toHaveBeenCalled();
+      },
+    );
+
+    it('returns 404 for an unknown Article before looking for a Comment', async () => {
+      manager.findOne.mockResolvedValueOnce(null);
+      await expect(
+        service.deleteComment('unknown', saved.id, authorId),
+      ).rejects.toMatchObject({
+        status: 404,
+        message: 'comments.ARTICLE_NOT_FOUND',
+      });
+      expect(manager.findOne).toHaveBeenCalledTimes(1);
+      expect(manager.delete).not.toHaveBeenCalled();
+      expect(log).not.toHaveBeenCalled();
+    });
+
+    it('returns 404 for an unknown Comment UUID', async () => {
+      manager.findOne
+        .mockResolvedValueOnce(article)
+        .mockResolvedValueOnce(null);
+      await expect(
+        service.deleteComment(
+          article.slug,
+          '00000000-0000-4000-8000-000000000099',
+          authorId,
+        ),
+      ).rejects.toMatchObject({ status: 404, message: 'comments.NOT_FOUND' });
+      expect(manager.delete).not.toHaveBeenCalled();
+      expect(log).not.toHaveBeenCalled();
+    });
+
+    it('returns 404 on repeated deletion', async () => {
+      await service.deleteComment(article.slug, saved.id, authorId);
+      manager.findOne
+        .mockResolvedValueOnce(article)
+        .mockResolvedValueOnce(null);
+      await expect(
+        service.deleteComment(article.slug, saved.id, authorId),
+      ).rejects.toMatchObject({ status: 404 });
+      expect(manager.delete).toHaveBeenCalledTimes(1);
+      expect(log).not.toHaveBeenCalled();
+    });
+
+    it.each([0, undefined])(
+      'never returns success when DELETE affected=%s',
+      async (affected) => {
+        manager.delete.mockResolvedValueOnce({ affected });
+        await expect(
+          service.deleteComment(article.slug, saved.id, authorId),
+        ).rejects.toMatchObject({ status: 404, message: 'comments.NOT_FOUND' });
+        expect(log).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each(['Article lookup', 'Comment lookup', 'DELETE'])(
+      'logs and sanitizes database failure during %s',
+      async (step) => {
+        const cause = failure('ER_BAD_FIELD_ERROR');
+        if (step === 'Article lookup')
+          manager.findOne.mockRejectedValueOnce(cause);
+        if (step === 'Comment lookup')
+          manager.findOne
+            .mockResolvedValueOnce(article)
+            .mockRejectedValueOnce(cause);
+        if (step === 'DELETE') manager.delete.mockRejectedValueOnce(cause);
+        let caught: unknown;
+        try {
+          await service.deleteComment(article.slug, saved.id, authorId);
+        } catch (error) {
+          caught = error;
+        }
+        expect(caught).toMatchObject({
+          status: 500,
+          cause,
+          message: 'comments.DELETION_FAILED',
+        });
+        expect(
+          JSON.stringify(
+            (caught as InternalServerErrorException).getResponse(),
+          ),
+        ).not.toMatch(/private|SQL|stack|query|constraint/i);
+        expect(log).toHaveBeenCalledWith('Comment deletion failed', {
+          errorType: 'QueryFailedError',
+          code: 'ER_BAD_FIELD_ERROR',
+        });
+        expect(JSON.stringify(log.mock.calls)).not.toMatch(
+          /private|body|password|token|SQL/i,
+        );
+      },
+    );
+
+    it('sanitizes unexpected non-database failures with the original cause', async () => {
+      const cause = new Error('private details');
+      manager.delete.mockRejectedValueOnce(cause);
+      await expect(
+        service.deleteComment(article.slug, saved.id, authorId),
+      ).rejects.toMatchObject({
+        status: 500,
+        cause,
+        message: 'comments.DELETION_FAILED',
+      });
+      expect(log).toHaveBeenCalledWith('Comment deletion failed', {
+        errorType: 'Error',
+        code: undefined,
+      });
+    });
+  });
 
   describe('getComments', () => {
     it('scopes the joined public projection to the resolved Article and delegates stable ordering to SQL', async () => {
