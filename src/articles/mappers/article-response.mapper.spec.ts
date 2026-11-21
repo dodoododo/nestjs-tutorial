@@ -1,4 +1,4 @@
-import { mapArticle } from './article-response.mapper';
+import { mapArticle, mapArticleSummary } from './article-response.mapper';
 
 describe('mapArticle', () => {
   it('allowlists public fields, converts timestamps and does not mutate inputs', () => {
@@ -28,6 +28,12 @@ describe('mapArticle', () => {
       following: true,
     };
     const result = mapArticle(loaded, metadata);
+    const summary = mapArticleSummary(loaded, metadata);
+    const { body: _body, ...expectedSummary } = result;
+    expect(summary).toEqual(expectedSummary);
+    expect(summary).not.toHaveProperty('body');
+    summary.tagList.push('summary-only');
+    expect(metadata.tagList).toEqual(['nestjs']);
     expect(result).toEqual({
       slug: 'title',
       title: 'Title',

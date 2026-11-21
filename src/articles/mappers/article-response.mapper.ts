@@ -1,6 +1,7 @@
 import type { Article } from '../../database/entities/article.entity';
 import type { User } from '../../database/entities/user.entity';
 import type { ArticleDto } from '../dto/article-response.dto';
+import type { ArticleSummaryDto } from '../dto/articles-response.dto';
 
 export type LoadedArticle = Pick<
   Article,
@@ -19,11 +20,19 @@ export function mapArticle(
   article: LoadedArticle,
   metadata: ArticleMetadata,
 ): ArticleDto {
+  return Object.assign(mapArticleSummary(article, metadata), {
+    body: article.body,
+  });
+}
+
+export function mapArticleSummary(
+  article: Omit<LoadedArticle, 'body'>,
+  metadata: ArticleMetadata,
+): ArticleSummaryDto {
   return {
     slug: article.slug,
     title: article.title,
     description: article.description,
-    body: article.body,
     tagList: [...metadata.tagList],
     createdAt: article.createdAt.toISOString(),
     updatedAt: article.updatedAt.toISOString(),

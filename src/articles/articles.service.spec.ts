@@ -9,6 +9,8 @@ import { DataSource, QueryFailedError } from 'typeorm';
 import { Article } from '../database/entities/article.entity';
 import { ArticleTag } from '../database/entities/article-tag.entity';
 import { ArticlesService } from './articles.service';
+import { ListArticlesQueryDto } from './dto/list-articles-query.dto';
+import { User } from '../database/entities/user.entity';
 
 describe('ArticlesService', () => {
   const loaded = {
@@ -27,6 +29,16 @@ describe('ArticlesService', () => {
     select: jest.fn().mockReturnThis(),
     addSelect: jest.fn().mockReturnThis(),
     where: jest.fn().mockReturnThis(),
+    andWhere: jest.fn().mockReturnThis(),
+    clone: jest.fn().mockReturnThis(),
+    subQuery: jest.fn().mockReturnThis(),
+    from: jest.fn().mockReturnThis(),
+    getQuery: jest.fn().mockReturnValue('(SELECT 1)'),
+    addOrderBy: jest.fn().mockReturnThis(),
+    limit: jest.fn().mockReturnThis(),
+    offset: jest.fn().mockReturnThis(),
+    getCount: jest.fn(),
+    getRawMany: jest.fn(),
     setParameter: jest.fn().mockReturnThis(),
     orderBy: jest.fn().mockReturnThis(),
     getRawAndEntities: jest.fn(),
@@ -74,6 +86,8 @@ describe('ArticlesService', () => {
       raw: [{ favoritesCount: '3', favorited: '1', following: '1' }],
     });
     qb.getMany.mockResolvedValue([{ name: 'nestjs' }]);
+    qb.getCount.mockResolvedValue(3);
+    qb.getRawMany.mockResolvedValue([{ articleId: loaded.id, name: 'nestjs' }]);
     transaction.mockImplementation(
       (_isolation, callback: (manager: unknown) => unknown) =>
         callback(manager),
@@ -81,6 +95,155 @@ describe('ArticlesService', () => {
   });
 
   afterEach(() => jest.restoreAllMocks());
+
+  describe('listArticles', () => {
+    it('maps a batch by stable IDs, omits body and selects only public columns', async () => {
+      qb.getRawAndEntities.mockResolvedValueOnce({
+        entities: [loaded, { ...loaded, id: 'second', slug: 'second' }],
+        raw: [
+          {
+            article_id: 'second',
+            favoritesCount: '0',
+            favorited: '0',
+            following: '0',
+          },
+          {
+            article_id: loaded.id,
+            favoritesCount: '3',
+            favorited: '1',
+            following: '1',
+          },
+        ],
+      });
+      const result = await service.listArticles(
+        new ListArticlesQueryDto(),
+        'viewer',
+      );
+      expect(result.articlesCount).toBe(3);
+      expect(result.articles).toHaveLength(2);
+      expect(result.articles[0]).toMatchObject({
+        tagList: ['nestjs'],
+        favoritesCount: 3,
+        favorited: true,
+        author: { following: true },
+      });
+      expect(result.articles[1]).toMatchObject({
+        tagList: [],
+        favoritesCount: 0,
+        favorited: false,
+        author: { following: false },
+      });
+      expect(result.articles[0]).not.toHaveProperty('body');
+      const projection = qb.select.mock.calls.find(([columns]) =>
+        Array.isArray(columns),
+      )![0] as string[];
+      expect(projection).not.toContain('article.body');
+      expect(projection).not.toContain('author.email');
+      expect(qb.limit).toHaveBeenCalledWith(20);
+      expect(qb.offset).toHaveBeenCalledWith(0);
+      expect(qb.orderBy).toHaveBeenCalledWith('article.createdAt', 'DESC');
+      expect(qb.addOrderBy).toHaveBeenCalledWith('article.id', 'DESC');
+      expect(qb.getCount).toHaveBeenCalledTimes(1);
+      expect(qb.getRawAndEntities).toHaveBeenCalledTimes(1);
+      expect(qb.getRawMany).toHaveBeenCalledTimes(1);
+      expect(manager.findOne).not.toHaveBeenCalled();
+    });
+
+    it('forces anonymous metadata false even if raw data contains flags', async () => {
+      qb.getRawAndEntities.mockResolvedValueOnce({
+        entities: [loaded],
+        raw: [
+          {
+            article_id: loaded.id,
+            favoritesCount: '3',
+            favorited: '1',
+            following: '1',
+          },
+        ],
+      });
+      const result = await service.listArticles(new ListArticlesQueryDto());
+      expect(result.articles[0]).toMatchObject({
+        favoritesCount: 3,
+        favorited: false,
+        author: { following: false },
+      });
+      expect(qb.setParameter).not.toHaveBeenCalled();
+    });
+
+    it.each(['author', 'favorited'] as const)(
+      'explicitly returns an empty result for an unknown %s',
+      async (field) => {
+        manager.findOne.mockResolvedValueOnce(null);
+        await expect(
+          service.listArticles(
+            Object.assign(new ListArticlesQueryDto(), { [field]: 'missing' }),
+          ),
+        ).resolves.toEqual({ articles: [], articlesCount: 0 });
+        expect(manager.findOne).toHaveBeenCalledWith(User, {
+          where: { username: 'missing' },
+          select: { id: true },
+        });
+        expect(manager.createQueryBuilder).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([0, 3])(
+      'retains the total %i on an empty or out-of-range page',
+      async (count) => {
+        qb.getCount.mockResolvedValueOnce(count);
+        await expect(
+          service.listArticles(
+            Object.assign(new ListArticlesQueryDto(), { offset: 10 }),
+          ),
+        ).resolves.toEqual({ articles: [], articlesCount: count });
+        expect(qb.getRawAndEntities).not.toHaveBeenCalled();
+        expect(qb.getRawMany).not.toHaveBeenCalled();
+      },
+    );
+
+    it('keeps filters parameterized and separate from the authenticated viewer', async () => {
+      manager.findOne
+        .mockResolvedValueOnce({ id: 'author-id' })
+        .mockResolvedValueOnce({ id: 'favorites-user' });
+      qb.getRawAndEntities.mockResolvedValueOnce({ entities: [], raw: [] });
+      await service.listArticles(
+        Object.assign(new ListArticlesQueryDto(), {
+          author: 'Author',
+          favorited: 'Alice',
+          tag: "tag' OR 1=1",
+          limit: 1,
+          offset: 2,
+        }),
+        'viewer-id',
+      );
+      expect(qb.andWhere).toHaveBeenCalledWith('article.authorId = :authorId', {
+        authorId: 'author-id',
+      });
+      expect(qb.andWhere).toHaveBeenCalledWith('EXISTS (SELECT 1)', {
+        tag: "tag' OR 1=1",
+      });
+      expect(qb.andWhere).toHaveBeenCalledWith('EXISTS (SELECT 1)', {
+        favoritedById: 'favorites-user',
+      });
+      expect(qb.setParameter).toHaveBeenCalledWith('viewerId', 'viewer-id');
+      expect(qb.limit).toHaveBeenCalledWith(1);
+      expect(qb.offset).toHaveBeenCalledWith(2);
+      expect(qb.getRawMany).not.toHaveBeenCalled();
+    });
+
+    it('sanitizes list persistence errors using the existing localized error', async () => {
+      const cause = failure('ER_BAD_FIELD_ERROR');
+      jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+      qb.getCount.mockRejectedValueOnce(cause);
+      await expect(
+        service.listArticles(new ListArticlesQueryDto()),
+      ).rejects.toMatchObject({
+        status: 500,
+        message: 'articles.PERSISTENCE_FAILED',
+        cause,
+      });
+    });
+  });
 
   it('uses the transaction manager for every write/read and deduplicates normalized tags', async () => {
     const result = await service.createArticle(

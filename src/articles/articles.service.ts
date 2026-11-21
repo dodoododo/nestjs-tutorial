@@ -14,11 +14,17 @@ import { ArticleTag } from '../database/entities/article-tag.entity';
 import { ArticleFavorite } from '../database/entities/article-favorite.entity';
 import { Follow } from '../database/entities/follow.entity';
 import { Tag } from '../database/entities/tag.entity';
+import { User } from '../database/entities/user.entity';
 import { ARTICLE_TRANSACTION_MAX_ATTEMPTS } from './constants/article.constant';
 import { CreateArticleDto, normalizeTag } from './dto/create-article.dto';
 import { ArticleResponseDto } from './dto/article-response.dto';
 import { UpdateArticleDto } from './dto/update-article.dto';
-import { mapArticle } from './mappers/article-response.mapper';
+import {
+  mapArticle,
+  mapArticleSummary,
+} from './mappers/article-response.mapper';
+import { ListArticlesQueryDto } from './dto/list-articles-query.dto';
+import { ArticlesResponseDto } from './dto/articles-response.dto';
 import { articleSlug } from './utils/article-slug.util';
 
 function mysqlCode(error: unknown): string | undefined {
@@ -113,6 +119,157 @@ export class ArticlesService {
   ): Promise<ArticleResponseDto> {
     try {
       return await this.loadArticle(this.dataSource.manager, slug, viewerId);
+    } catch (error: unknown) {
+      this.handlePersistenceError(error);
+    }
+  }
+
+  async listArticles(
+    dto: ListArticlesQueryDto,
+    viewerId?: string,
+  ): Promise<ArticlesResponseDto> {
+    try {
+      const manager = this.dataSource.manager;
+      // Resolve each supplied username using MySQL's own collation, just like
+      // profile lookup. Missing users are empty filters, never a resource 404.
+      const author =
+        dto.author === undefined
+          ? undefined
+          : await manager.findOne(User, {
+              where: { username: dto.author },
+              select: { id: true },
+            });
+      if (author === null) return { articles: [], articlesCount: 0 };
+      const favoritedBy =
+        dto.favorited === undefined
+          ? undefined
+          : await manager.findOne(User, {
+              where: { username: dto.favorited },
+              select: { id: true },
+            });
+      if (favoritedBy === null) return { articles: [], articlesCount: 0 };
+
+      const matches = manager.createQueryBuilder(Article, 'article');
+      if (author)
+        matches.andWhere('article.authorId = :authorId', {
+          authorId: author.id,
+        });
+      if (dto.tag !== undefined) {
+        const tagMatch = matches
+          .subQuery()
+          .select('1')
+          .from(ArticleTag, 'tagLink')
+          .innerJoin('tagLink.tag', 'filterTag')
+          .where('tagLink.articleId = article.id')
+          .andWhere('filterTag.name = :tag');
+        matches.andWhere(`EXISTS ${tagMatch.getQuery()}`, { tag: dto.tag });
+      }
+      if (favoritedBy) {
+        const favoriteMatch = matches
+          .subQuery()
+          .select('1')
+          .from(ArticleFavorite, 'filterFavorite')
+          .where('filterFavorite.articleId = article.id')
+          .andWhere('filterFavorite.userId = :favoritedById');
+        matches.andWhere(`EXISTS ${favoriteMatch.getQuery()}`, {
+          favoritedById: favoritedBy.id,
+        });
+      }
+
+      const articlesCount = await matches.getCount();
+      if (dto.offset >= articlesCount) return { articles: [], articlesCount };
+
+      // EXISTS never multiplies article rows; the only page join is many-to-one.
+      // LIMIT/OFFSET therefore operate directly on articles, with no ID-page
+      // hydration query and no body or private author columns selected.
+      const page = matches
+        .clone()
+        .innerJoin('article.author', 'author')
+        .select([
+          'article.id',
+          'article.slug',
+          'article.title',
+          'article.description',
+          'article.createdAt',
+          'article.updatedAt',
+          'author.username',
+          'author.bio',
+          'author.image',
+        ])
+        .addSelect(
+          (sub) =>
+            sub
+              .select('COUNT(*)')
+              .from(ArticleFavorite, 'favorite')
+              .where('favorite.articleId = article.id'),
+          'favoritesCount',
+        )
+        .orderBy('article.createdAt', 'DESC')
+        .addOrderBy('article.id', 'DESC')
+        .limit(dto.limit)
+        .offset(dto.offset);
+      if (viewerId !== undefined) {
+        page
+          .addSelect(
+            (sub) =>
+              sub
+                .select('COUNT(*)')
+                .from(ArticleFavorite, 'mine')
+                .where(
+                  'mine.articleId = article.id AND mine.userId = :viewerId',
+                ),
+            'favorited',
+          )
+          .addSelect(
+            (sub) =>
+              sub
+                .select('COUNT(*)')
+                .from(Follow, 'follow')
+                .where(
+                  'follow.followingId = article.authorId AND follow.followerId = :viewerId',
+                ),
+            'following',
+          )
+          .setParameter('viewerId', viewerId);
+      }
+      const { entities, raw } = await page.getRawAndEntities<{
+        article_id: string;
+        favoritesCount: string;
+        favorited?: string;
+        following?: string;
+      }>();
+      if (!entities.length) return { articles: [], articlesCount };
+      const tags = await manager
+        .createQueryBuilder(ArticleTag, 'link')
+        .innerJoin('link.tag', 'tag')
+        .select('link.articleId', 'articleId')
+        .addSelect('tag.name', 'name')
+        .where('link.articleId IN (:...ids)', {
+          ids: entities.map((article) => article.id),
+        })
+        .orderBy('tag.name', 'ASC')
+        .getRawMany<{ articleId: string; name: string }>();
+      const tagsByArticle = new Map<string, string[]>();
+      for (const tag of tags) {
+        const names = tagsByArticle.get(tag.articleId) ?? [];
+        names.push(tag.name);
+        tagsByArticle.set(tag.articleId, names);
+      }
+      const metadataByArticle = new Map(
+        raw.map((row) => [row.article_id, row]),
+      );
+      return {
+        articlesCount,
+        articles: entities.map((article) => {
+          const metadata = metadataByArticle.get(article.id)!;
+          return mapArticleSummary(article, {
+            tagList: tagsByArticle.get(article.id) ?? [],
+            favoritesCount: Number(metadata.favoritesCount),
+            favorited: viewerId !== undefined && Number(metadata.favorited) > 0,
+            following: viewerId !== undefined && Number(metadata.following) > 0,
+          });
+        }),
+      };
     } catch (error: unknown) {
       this.handlePersistenceError(error);
     }

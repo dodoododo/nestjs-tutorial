@@ -1,7 +1,8 @@
-# PR4 article APIs: Commits 2 and 3
+# PR4 article APIs: Commits 2, 3 and 4
 
 Commit 2 adds `POST /api/articles` and `GET /api/articles/:slug`. Commit 3 adds
-`PUT /api/articles/:slug` and `DELETE /api/articles/:slug`. Schema,
+`PUT /api/articles/:slug` and `DELETE /api/articles/:slug`. Commit 4 adds
+`GET /api/articles` with filtering and pagination. Schema,
 migrations, `synchronize: false`, and the existing authentication implementation
 remain unchanged. The request and single-article response follow the
 [RealWorld contract](https://realworld-docs.netlify.app/specifications/backend/endpoints/).
@@ -152,6 +153,94 @@ article attachments will therefore need an explicit cleanup policy; this
 checkpoint does not introduce article attachment operations or speculative
 cleanup of those records.
 
+## List Articles (Commit 4)
+
+`GET /api/articles` uses the existing `OptionalJwtAuthGuard`. Anonymous requests
+succeed without consulting Redis. Supplied invalid, expired, incorrectly signed,
+or revoked JWTs return 401; a Redis revocation failure remains fail-closed (503).
+The JWT strategy supplies the viewer identity; the query cannot override it.
+
+The collection follows the current [RealWorld multiple-articles response](https://realworld-docs.netlify.app/specifications/backend/api-response-format/#multiple-articles):
+`{ "articles": [...], "articlesCount": n }`. `ArticlesResponseDto` explicitly
+declares an array of `ArticleSummaryDto`, derived from the existing article DTO
+with `body` omitted. Body is also excluded from the SQL projection, rather than
+loaded and discarded. `mapArticleSummary` is a pure public-field allowlist with
+no repositories, queries or injected services. Single-article mapping reuses it
+and adds body. Dates use ISO strings; metadata and tag arrays are already loaded.
+Author responses contain only username, bio, image and following.
+
+### Query policy
+
+Only `tag`, `author`, `favorited`, `limit` and `offset` are accepted. The route
+uses the existing transforming, whitelisting `ValidationPipe` with
+`forbidNonWhitelisted: true`. Swagger describes every parameter and its bounds.
+
+- `tag`: trimmed, NFC normalized, lowercased and NFC normalized again, using
+  Create's existing normalization. It must contain 1–64 Unicode characters.
+- `author` and `favorited`: trimmed, 3–50 characters, retaining case and accents
+  just like username writes. Equality follows the existing MySQL collation.
+  `favorited` names the user whose favorites are being filtered, independently
+  of the authenticated viewer. It is available to anonymous requests.
+- `limit`: defaults to 20 only when omitted; integer 1–100. The maximum 100 is
+  this project's explicit pagination policy.
+- `offset`: defaults to 0 only when omitted; integer 0–9,007,199,254,740,991
+  (`Number.MAX_SAFE_INTEGER`). Offsets past the total return an empty page
+  together with the matching total.
+
+All supplied empty values, including whitespace-only filters, return 400.
+Filter arrays, objects, null and invalid Unicode are rejected. Pagination
+accepts only unsigned decimal digit strings (leading zeros allowed); signs,
+whitespace, fractions, exponent/hex notation, NaN, Infinity, unsafe numbers,
+arrays, objects, and partial numeric strings return 400. Defaults never hide
+malformed values. Repeated parameters and bracket/object syntax are rejected,
+as are unknown query keys. Transformation helpers live in a separate utility
+file. Use `x-lang` or `Accept-Language` for localized errors; `lang` is not an
+allowed list query key.
+
+Examples: `/api/articles?tag=nestjs&author=jacob&limit=10` and
+`/api/articles?favorited=alice&offset=20`.
+
+### Filtering, paging and bounded queries
+
+Supplied username filters are resolved to IDs using minimal User projections
+and database collation. A missing author or favoriting user explicitly returns
+`{ "articles": [], "articlesCount": 0 }` before querying articles. An unknown tag
+naturally matches no articles. Every supplied filter combines with AND, and
+all external values are bound SQL parameters.
+
+Tag and favorite filters use correlated `EXISTS` subqueries through ArticleTag,
+Tag and ArticleFavorite. These predicates do not multiply article rows, even
+with multiple tags and favorites. Only the many-to-one author is joined into
+the page, so direct LIMIT/OFFSET is correct without a separate ID-page query.
+The count uses the same filters before pagination. Ordering is
+`article.createdAt DESC, article.id DESC`; the UUID breaks timestamp ties.
+
+A nonempty unfiltered list executes exactly three SQL statements:
+
+1. Count all matching articles before pagination.
+2. Select the requested page's public fields and author, with indexed
+   correlated counts for favoritesCount and, when authenticated, viewer
+   favorite and author-follow state.
+3. Load all tags for page article IDs in one `IN` query, in stored name order.
+
+Each supplied username filter adds one lookup (at most two). JWT authentication
+adds its existing one-user lookup. Thus there are at most five list retrieval
+statements, or six including authentication, independent of page size. Empty
+and out-of-range pages skip the page/tag reads. No mapping loop performs SQL;
+tag and raw metadata maps are keyed by article UUID. Tag filtering does not
+truncate the article's complete tagList. Anonymous flags are always false,
+while favorite counts remain accurate. Existing database indexes support these
+lookups; no schema change or dependency is needed.
+
+Count, page and tags are separate reads, so concurrent writes can change data
+between them; this endpoint does not promise snapshot consistency. Deep offset
+pagination can become slower as the offset grows. The deterministic order
+stabilizes unchanged data, without promising stable pages across new writes.
+
+The collection GET is declared before `GET :slug`. A future static `GET feed`
+must also be registered before `:slug`; this checkpoint does not implement or
+reserve a feed endpoint, and existing slug behavior is preserved.
+
 ## Verification
 
 Unit tests cover validation, Unicode/byte boundaries, slug normalization and
@@ -167,7 +256,20 @@ database-level slug races synchronized after both prechecks, disjoint updates,
 concurrent delete/update handling, preserved tag/favorite metadata, empty 204
 responses, and rollback of both writes and deletion cascades after injected
 persistence failures. Swagger tests verify only Create/Get/Update/Delete are
-exposed, with Update accepting exactly its three optional fields.
+exposed, with Update accepting exactly its three optional fields. Commit 4
+updates the Swagger assertion to include List, all five query parameters and
+the body-free summary schema.
+
+Commit 4 unit tests cover strict query validation/defaults/normalization,
+missing-user early returns, parameterized combined filters, empty-page totals,
+minimal projections, ID-based batch metadata mapping, anonymous flags and
+sanitized persistence errors. E2E coverage adds default and explicit pagination,
+timestamp ties, collation-aware combined filters, full tag lists, duplicate
+prevention, anonymous/authenticated metadata, malformed and repeated queries,
+and the existing JWT/Redis security cases for List. A real TypeORM SQL logger
+asserts three anonymous statements and four authenticated statements at both
+page sizes 1 and 20, verifies batch tags and excludes body/private columns from
+list retrieval. All fixtures use the isolated test services below.
 
 E2E fixtures refuse writes outside `127.0.0.1:3308/nestjs_tutorial_test` and require
 the test Redis instance at `127.0.0.1:6380`. Cleanup removes only fixture users,

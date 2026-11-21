@@ -18,6 +18,7 @@ import {
 import { AppModule } from '../src/app.module';
 import { INVALID_USER_PASSWORD_HASH } from '../src/auth/constants/auth.constant';
 import { ArticleResponseDto } from '../src/articles/dto/article-response.dto';
+import { ArticlesResponseDto } from '../src/articles/dto/articles-response.dto';
 import { Article } from '../src/database/entities/article.entity';
 import { ArticleTag } from '../src/database/entities/article-tag.entity';
 import { ArticleFavorite } from '../src/database/entities/article-favorite.entity';
@@ -76,6 +77,33 @@ describe('Article APIs (e2e)', () => {
     if (authorization !== undefined) req.set('Authorization', authorization);
     return req;
   }
+  function list(query: Record<string, unknown> = {}, authorization?: string) {
+    const req = request(app.getHttpServer()).get('/api/articles').query(query);
+    if (authorization !== undefined) req.set('Authorization', authorization);
+    return req;
+  }
+  async function seedList(count: number) {
+    const records = Array.from({ length: count }, (_, index) => ({
+      id: randomUUID(),
+      ...input(),
+      slug: `${prefix}-${index}`,
+      authorId: author.id,
+      // Adjacent pairs tie, so ID ordering is exercised across page boundaries.
+      createdAt: new Date(Date.UTC(2026, 0, 1, 0, 0, Math.floor(index / 2))),
+      updatedAt: new Date('2026-01-01T00:00:00.000Z'),
+    }));
+    // TypeORM merges generated timestamp values into inserted objects. Preserve
+    // the independently specified expected order before executing the insert.
+    const expected = records
+      .map((record) => ({ ...record }))
+      .sort(
+        (a, b) =>
+          b.createdAt.getTime() - a.createdAt.getTime() ||
+          (a.id < b.id ? 1 : -1),
+      );
+    await articles.insert(records);
+    return expected;
+  }
   async function create(overrides: Record<string, unknown> = {}) {
     const response = await post(input(overrides)).expect(201);
     return (response.body as ArticleResponseDto).article;
@@ -95,11 +123,12 @@ describe('Article APIs (e2e)', () => {
   }
 
   function authenticatedRequest(
-    method: 'post' | 'get' | 'put' | 'delete',
+    method: 'post' | 'get' | 'put' | 'delete' | 'list',
     slug: string,
     authorization = `Bearer ${token}`,
   ) {
     if (method === 'post') return post(input(), authorization);
+    if (method === 'list') return list({}, authorization);
     if (method === 'get') return get(slug, authorization);
     return mutate(method, slug, { body: 'Changed' }, authorization);
   }
@@ -209,7 +238,7 @@ describe('Article APIs (e2e)', () => {
     expect(await articles.countBy({ authorId: author.id })).toBe(0);
   });
 
-  it.each(['post', 'get', 'put', 'delete'] as const)(
+  it.each(['post', 'get', 'put', 'delete', 'list'] as const)(
     '%s rejects invalid, expired, incorrectly signed and revoked JWTs',
     async (method) => {
       const article = await create();
@@ -245,7 +274,7 @@ describe('Article APIs (e2e)', () => {
     },
   );
 
-  it.each(['post', 'get', 'put', 'delete'] as const)(
+  it.each(['post', 'get', 'put', 'delete', 'list'] as const)(
     '%s fails closed when Redis is unavailable',
     async (method) => {
       const article = await create();
@@ -955,7 +984,280 @@ describe('Article APIs (e2e)', () => {
     });
   });
 
-  it('documents only the four article operations and their DTOs', async () => {
+  describe('List Articles', () => {
+    it('returns an empty collection from an empty test database without using Redis', async () => {
+      expect(await articles.count()).toBe(0);
+      const revocation = jest.spyOn(app.get(RedisService), 'isTokenRevoked');
+      const response = await list().expect(200);
+      expect(response.body).toEqual({ articles: [], articlesCount: 0 });
+      expect(revocation).not.toHaveBeenCalled();
+    });
+
+    it('defaults to 20, orders by timestamp and ID, and keeps totals on every page', async () => {
+      const records = await seedList(23);
+      const first = (await list().expect(200)).body as ArticlesResponseDto;
+      expect(first.articlesCount).toBe(23);
+      expect(first.articles.map((article) => article.slug)).toEqual(
+        records.slice(0, 20).map((record) => record.slug),
+      );
+      const second = (await list({ offset: 20 }).expect(200))
+        .body as ArticlesResponseDto;
+      expect(second.articlesCount).toBe(23);
+      expect(second.articles.map((article) => article.slug)).toEqual(
+        records.slice(20).map((record) => record.slug),
+      );
+      const page = (await list({ limit: 2, offset: 1 }).expect(200))
+        .body as ArticlesResponseDto;
+      expect(page.articlesCount).toBe(23);
+      expect(page.articles.map((article) => article.slug)).toEqual(
+        records.slice(1, 3).map((record) => record.slug),
+      );
+      for (const offset of [23, 100, Number.MAX_SAFE_INTEGER]) {
+        expect((await list({ offset }).expect(200)).body).toEqual({
+          articles: [],
+          articlesCount: 23,
+        });
+      }
+      expect(
+        (await list({ limit: 100 }).expect(200)).body.articles,
+      ).toHaveLength(23);
+      for (const article of first.articles) {
+        expect(Object.keys(article).sort()).toEqual(
+          [
+            'slug',
+            'title',
+            'description',
+            'tagList',
+            'createdAt',
+            'updatedAt',
+            'favorited',
+            'favoritesCount',
+            'author',
+          ].sort(),
+        );
+        expect(article.author).toEqual({
+          username: author.username,
+          bio: null,
+          image: null,
+          following: false,
+        });
+        expect(article.favorited).toBe(false);
+      }
+    });
+
+    it('combines tag, author and another user’s favorites without duplicates or truncated tag lists', async () => {
+      const records = await seedList(4);
+      await articles.update(records[2].id, { authorId: other.id });
+      const name = tag('café');
+      const extraName = tag('extra');
+      const [firstTag, extraTag] = await tags.save([
+        { name },
+        { name: extraName },
+      ]);
+      await dataSource.getRepository(ArticleTag).insert([
+        { articleId: records[0].id, tagId: firstTag.id },
+        { articleId: records[0].id, tagId: extraTag.id },
+        { articleId: records[1].id, tagId: firstTag.id },
+        { articleId: records[2].id, tagId: firstTag.id },
+      ]);
+      await dataSource.getRepository(ArticleFavorite).insert([
+        { articleId: records[0].id, userId: viewer.id },
+        { articleId: records[0].id, userId: other.id },
+        { articleId: records[2].id, userId: viewer.id },
+        { articleId: records[3].id, userId: viewer.id },
+      ]);
+      const byTag = (
+        await list({ tag: ` ${name.toUpperCase().replace('É', 'E')} ` }).expect(
+          200,
+        )
+      ).body as ArticlesResponseDto;
+      expect(byTag.articlesCount).toBe(3);
+      expect(byTag.articles.map((article) => article.slug)).toEqual(
+        records.slice(0, 3).map((record) => record.slug),
+      );
+      expect(byTag.articles[0].tagList.sort()).toEqual(
+        [name, extraName].sort(),
+      );
+      expect(byTag.articles[0].favoritesCount).toBe(2);
+      const byAuthor = (
+        await list({ author: ` ${author.username.toUpperCase()} ` }).expect(200)
+      ).body as ArticlesResponseDto;
+      expect(byAuthor.articles.map((article) => article.slug)).toEqual(
+        [records[0], records[1], records[3]].map((record) => record.slug),
+      );
+      const byFavorite = (
+        await list({ favorited: ` ${viewer.username.toUpperCase()} ` }).expect(
+          200,
+        )
+      ).body as ArticlesResponseDto;
+      expect(byFavorite.articles.map((article) => article.slug)).toEqual(
+        [records[0], records[2], records[3]].map((record) => record.slug),
+      );
+      const combined = {
+        tag: name,
+        author: author.username,
+        favorited: viewer.username,
+      };
+      const result = (await list(combined, `Bearer ${token}`).expect(200))
+        .body as ArticlesResponseDto;
+      expect(result.articlesCount).toBe(1);
+      expect(result.articles[0]).toMatchObject({
+        slug: records[0].slug,
+        favoritesCount: 2,
+        favorited: false,
+      });
+      expect((await list({ ...combined, offset: 1 }).expect(200)).body).toEqual(
+        { articles: [], articlesCount: 1 },
+      );
+      const filteredPage = (
+        await list({ tag: name, limit: 1, offset: 1 }).expect(200)
+      ).body as ArticlesResponseDto;
+      expect(filteredPage.articlesCount).toBe(3);
+      expect(filteredPage.articles.map((article) => article.slug)).toEqual([
+        records[1].slug,
+      ]);
+      for (const query of [
+        { author: 'missing-user' },
+        { favorited: 'missing-user' },
+        { tag: 'missing-tag' },
+        { tag: "x' OR 1=1 --" },
+        { author: "x' OR 1=1 --" },
+      ]) {
+        expect((await list(query).expect(200)).body).toEqual({
+          articles: [],
+          articlesCount: 0,
+        });
+      }
+    });
+
+    it('returns batch metadata for a viewer across followed/unfollowed authors and favorited/unfavorited articles', async () => {
+      const records = await seedList(3);
+      await articles.update(records[1].id, { authorId: other.id });
+      await dataSource.getRepository(ArticleFavorite).insert([
+        { articleId: records[0].id, userId: viewer.id },
+        { articleId: records[0].id, userId: other.id },
+        { articleId: records[1].id, userId: viewer.id },
+      ]);
+      await dataSource
+        .getRepository(Follow)
+        .insert({ followerId: viewer.id, followingId: author.id });
+      const viewerToken = await app
+        .get(JwtService)
+        .signAsync({ sub: viewer.id, jti: randomUUID() });
+      const response = (await list({}, `Bearer ${viewerToken}`).expect(200))
+        .body as ArticlesResponseDto;
+      expect(
+        response.articles.map((article) => [
+          article.favoritesCount,
+          article.favorited,
+          article.author.following,
+        ]),
+      ).toEqual([
+        [2, true, true],
+        [1, true, false],
+        [0, false, true],
+      ]);
+      const anonymous = (await list().expect(200)).body as ArticlesResponseDto;
+      expect(
+        anonymous.articles.map((article) => article.favoritesCount),
+      ).toEqual([2, 1, 0]);
+      expect(
+        anonymous.articles.every(
+          (article) => !article.favorited && !article.author.following,
+        ),
+      ).toBe(true);
+    });
+
+    it.each([
+      'limit=-1',
+      'limit=0',
+      'limit=101',
+      'limit=1.5',
+      'limit=1.0',
+      'limit=NaN',
+      'limit=Infinity',
+      'limit=1x',
+      'limit=1e2',
+      'limit=0x10',
+      'limit=',
+      'limit=%20',
+      'limit=1%0A',
+      'offset=-1',
+      'offset=1.5',
+      'offset=NaN',
+      'offset=Infinity',
+      'offset=9007199254740992',
+      'offset=',
+      'offset=1%0A',
+      'limit=1&limit=2',
+      'offset=0&offset=1',
+      'tag=a&tag=b',
+      'author=alice&author=bob',
+      'favorited=alice&favorited=bob',
+      'limit[]=1',
+      'offset[value]=0',
+      'tag[]=nestjs',
+      'author[value]=alice',
+      'favorited[]=alice',
+      'tag=',
+      'tag=%20',
+      'author=',
+      'author=ab',
+      'favorited=',
+      'favorited=ab',
+      'unknown=x',
+      `tag=${'x'.repeat(65)}`,
+      `author=${'x'.repeat(51)}`,
+      `favorited=${'x'.repeat(51)}`,
+    ])('rejects malformed query %s', async (query) => {
+      await request(app.getHttpServer())
+        .get(`/api/articles?${query}`)
+        .expect(400);
+    });
+
+    it('uses a fixed SQL query count as page size grows and never selects article body', async () => {
+      const records = await seedList(21);
+      const names = [tag('one'), tag('two')];
+      const storedTags = await tags.save(names.map((name) => ({ name })));
+      await dataSource.getRepository(ArticleTag).insert(
+        records.flatMap((article) =>
+          storedTags.map((storedTag) => ({
+            articleId: article.id,
+            tagId: storedTag.id,
+          })),
+        ),
+      );
+      const sql = jest.spyOn(dataSource.logger, 'logQuery');
+      for (const limit of [1, 20]) {
+        sql.mockClear();
+        const response = (await list({ limit }).expect(200))
+          .body as ArticlesResponseDto;
+        expect(response.articles).toHaveLength(limit);
+        expect(
+          response.articles.every((article) => article.tagList.length === 2),
+        ).toBe(true);
+        expect(sql).toHaveBeenCalledTimes(3); // count, page with metadata, all page tags
+        const statements = sql.mock.calls.map(([query]) => query);
+        expect(statements.join('\n')).not.toMatch(
+          /`body`|`email`|`password_hash`/,
+        );
+        expect(statements[1]).toContain('favoritesCount');
+        expect(statements[2]).toContain(' IN (');
+        sql.mockClear();
+        await list({ limit }, `Bearer ${token}`).expect(200);
+        expect(sql).toHaveBeenCalledTimes(4); // JWT strategy adds one user lookup
+        expect(
+          sql.mock.calls.filter(
+            ([query]) =>
+              query.includes(' AS `favorited`') &&
+              query.includes(' AS `following`'),
+          ),
+        ).toHaveLength(1);
+      }
+    });
+  });
+
+  it('documents only the five article operations and their DTOs', async () => {
     const response = await request(app.getHttpServer())
       .get('/docs-json')
       .expect(200);
@@ -967,6 +1269,26 @@ describe('Article APIs (e2e)', () => {
     expect(
       response.body.paths['/api/articles'].post.responses['201'],
     ).toBeDefined();
+    const collection = response.body.paths['/api/articles'];
+    expect(Object.keys(collection).sort()).toEqual(['get', 'post']);
+    expect(collection.get.security).toEqual([{}, { bearer: [] }]);
+    expect(
+      collection.get.parameters
+        .map((parameter: { name: string }) => parameter.name)
+        .sort(),
+    ).toEqual(['author', 'favorited', 'limit', 'offset', 'tag']);
+    expect(
+      collection.get.parameters.find(
+        (parameter: { name: string }) => parameter.name === 'limit',
+      ).schema,
+    ).toMatchObject({ default: 20, minimum: 1, maximum: 100 });
+    expect(
+      response.body.components.schemas.ArticlesResponseDto.properties.articles
+        .items.$ref,
+    ).toBe('#/components/schemas/ArticleSummaryDto');
+    expect(
+      response.body.components.schemas.ArticleSummaryDto.properties.body,
+    ).toBeUndefined();
     expect(response.body.paths['/api/articles/{slug}'].get.security).toEqual([
       {},
       { bearer: [] },

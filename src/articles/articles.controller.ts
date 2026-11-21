@@ -8,6 +8,7 @@ import {
   Param,
   Post,
   Put,
+  Query,
   UseGuards,
   UsePipes,
   ValidationPipe,
@@ -34,6 +35,8 @@ import { ArticlesService } from './articles.service';
 import { ArticleResponseDto } from './dto/article-response.dto';
 import { CreateArticleRequestDto } from './dto/create-article.dto';
 import { UpdateArticleRequestDto } from './dto/update-article.dto';
+import { ListArticlesQueryDto } from './dto/list-articles-query.dto';
+import { ArticlesResponseDto } from './dto/articles-response.dto';
 
 @ApiTags('Articles')
 @ApiUnauthorizedResponse({
@@ -69,6 +72,34 @@ export class ArticlesController {
     @CurrentUser() principal: AuthenticatedPrincipal,
   ): Promise<ArticleResponseDto> {
     return this.articles.createArticle(body.article, principal.user.id);
+  }
+
+  // Collection/static GET routes belong above :slug. Add a future feed route
+  // here as well, before the dynamic route, when that endpoint is implemented.
+  @Get()
+  @UseGuards(OptionalJwtAuthGuard)
+  @UsePipes(
+    new ValidationPipe({
+      transform: true,
+      whitelist: true,
+      forbidNonWhitelisted: true,
+    }),
+  )
+  @ApiOperation({
+    summary: 'List articles',
+    description:
+      'Newest first; filters combine with AND. Anonymous access is allowed. Supplied credentials must be valid. Empty and unknown query parameters are rejected.',
+    security: [{}, { bearer: [] }],
+  })
+  @ApiOkResponse({ type: ArticlesResponseDto })
+  @ApiBadRequestResponse({
+    description: 'Invalid, repeated or unknown query parameters',
+  })
+  list(
+    @Query() query: ListArticlesQueryDto,
+    @CurrentUser() principal: AuthenticatedPrincipal | undefined,
+  ): Promise<ArticlesResponseDto> {
+    return this.articles.listArticles(query, principal?.user.id);
   }
 
   @Get(':slug')
