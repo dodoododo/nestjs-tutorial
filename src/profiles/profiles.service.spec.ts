@@ -71,6 +71,27 @@ describe('ProfilesService', () => {
     expect(followsRepository.existsBy).not.toHaveBeenCalled();
   });
 
+  it.each(['getProfile', 'follow', 'unfollow'] as const)(
+    'preserves nullable public fields through %s',
+    async (method) => {
+      usersRepository.findOne.mockResolvedValue({
+        ...target,
+        bio: null,
+        image: null,
+        role: 'private-role',
+        token: 'private-token',
+      });
+      expect(await service[method](target.username, 'current-user')).toEqual({
+        profile: {
+          username: target.username,
+          bio: null,
+          image: null,
+          following: method === 'follow',
+        },
+      });
+    },
+  );
+
   it.each([true, false])(
     'returns following: %s for the current user relationship',
     async (following) => {

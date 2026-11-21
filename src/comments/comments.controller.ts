@@ -1,6 +1,8 @@
 import {
   Body,
   Controller,
+  Get,
+  Header,
   HttpCode,
   HttpStatus,
   Param,
@@ -17,6 +19,7 @@ import {
   ApiInternalServerErrorResponse,
   ApiNotFoundResponse,
   ApiOperation,
+  ApiOkResponse,
   ApiParam,
   ApiServiceUnavailableResponse,
   ApiTags,
@@ -24,15 +27,45 @@ import {
 } from '@nestjs/swagger';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import { OptionalJwtAuthGuard } from '../auth/guards/optional-jwt-auth.guard';
 import type { AuthenticatedPrincipal } from '../auth/interfaces/authenticated-request.interface';
 import { CommentsService } from './comments.service';
 import { CommentResponseDto } from './dto/comment-response.dto';
 import { CreateCommentRequestDto } from './dto/create-comment.dto';
+import { CommentsResponseDto } from './dto/comments-response.dto';
 
 @ApiTags('Comments')
 @Controller('articles/:slug/comments')
 export class CommentsController {
   constructor(private readonly comments: CommentsService) {}
+
+  @Get()
+  @Header('Cache-Control', 'private, no-store')
+  @UseGuards(OptionalJwtAuthGuard)
+  @ApiOperation({
+    summary: 'Get comments from an article',
+    description:
+      'Anonymous access is allowed. Supplied credentials must be valid. Ordered by createdAt DESC, id DESC; no pagination.',
+    security: [{}, { bearer: [] }],
+  })
+  @ApiParam({ name: 'slug', description: 'Current article slug', type: String })
+  @ApiOkResponse({ type: CommentsResponseDto })
+  @ApiNotFoundResponse({ description: 'Article not found' })
+  @ApiUnauthorizedResponse({
+    description: 'Supplied JWT is malformed, invalid, expired or revoked',
+  })
+  @ApiServiceUnavailableResponse({
+    description: 'JWT revocation check unavailable for supplied credentials',
+  })
+  @ApiInternalServerErrorResponse({
+    description: 'Unable to retrieve comments',
+  })
+  get(
+    @Param('slug') slug: string,
+    @CurrentUser() principal: AuthenticatedPrincipal | undefined,
+  ): Promise<CommentsResponseDto> {
+    return this.comments.getComments(slug, principal?.user.id);
+  }
 
   @Post()
   @HttpCode(HttpStatus.CREATED)

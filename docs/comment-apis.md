@@ -1,9 +1,11 @@
-# PR5 Comment API: Commit 2
+# PR5 Comment APIs: Commits 2–3
 
-This checkpoint implements only `POST /api/articles/:slug/comments`.
+Commit 2 implements `POST /api/articles/:slug/comments`. Commit 3 adds
+`GET /api/articles/:slug/comments` with optional authentication and shared public
+profile mapping.
 The nested request and Single Comment response follow the
 [RealWorld Add Comment contract](https://realworld-docs.netlify.app/specifications/backend/endpoints/#add-comments-to-an-article).
-GET Comments, DELETE Comment and later features are not implemented.
+DELETE Comment and later features are not implemented.
 
 ## Request and project conventions
 
@@ -86,7 +88,87 @@ relations, email, password hashes and tokens are excluded. Dates use the same
 `toISOString()` format as Articles. For creation the viewer is the Comment author;
 self-follow is prohibited, so the service supplies false without a following
 query. The mapper also supports true metadata for later collection responses.
-No SQL blocks or profile-query helpers are copied from ArticlesService.
+Both Comment and Article mappers now call `mapProfile`, a small pure mapper under
+`src/profiles/mappers/`. Its typed input contains only `username`, `bio` and
+`image`; following is supplied separately. It returns an explicit public
+allowlist and does not query repositories. ProfilesService also uses it for
+Get Profile, Follow and Unfollow responses. Existing Article correlated SQL and
+Profile/Follow queries remain unchanged; their distinct query strategies stay
+in the service layer. Regression tests cover both following values, populated
+and nullable profiles, private-field exclusion and unchanged response shapes.
+
+## Get Comments
+
+Listing follows the
+[RealWorld Get Comments contract](https://realworld-docs.netlify.app/specifications/backend/endpoints/#get-comments-from-an-article).
+
+```http
+GET /api/articles/current-article-slug/comments
+Authorization: Bearer <optional JWT>
+```
+
+An existing Article returns HTTP 200 with `{ "comments": [...] }`. Existing
+Articles without Comments return `{ "comments": [] }`; unknown slugs return 404
+using the existing Comments-domain localized Article-not-found message. There is
+no `commentsCount`. Every item reuses `CommentDto` and the same `mapComment`
+function used by POST, including UUID identity, exact body text, ISO timestamps
+and the public author profile.
+
+`OptionalJwtAuthGuard` permits anonymous access only when Authorization is absent.
+Supplied malformed headers, invalid/expired/incorrectly signed/revoked tokens,
+and tokens for deleted users return 401. Redis failure returns 503 for supplied
+valid credentials; anonymous reads bypass JWT/Redis checks. The viewer comes
+only from the authenticated principal. Query parameters cannot select an Article
+UUID or impersonate a viewer: unsupported identity parameters are ignored, as
+with the existing single-Article route. No filtering or pagination parameters
+are implemented or documented.
+
+GET Comments sends `Cache-Control: private, no-store` for both anonymous and
+authenticated successful responses, including empty lists. `author.following`
+depends on the viewer, so the response must not be stored for later reuse across
+requests or identities. The header is scoped to this GET handler; there is no
+global API cache policy. E2E coverage checks the actual HTTP header for anonymous,
+following and non-following viewers requesting the same Article, and for empty
+lists. This uses the established Nest `@Header` convention without changing
+service queries or other endpoints.
+
+The retrieval path uses a fixed number of SQL statements:
+
+1. Resolve the current Article slug, selecting only its UUID.
+2. Fetch matching Comments through a single inner join to User, selecting
+   Comment ID/body/timestamps and author ID/username/bio/image. Scope by
+   `comments.article_id` with a bound parameter and order in SQL by
+   `created_at DESC, id DESC`. The existing `(article_id, created_at, id)` index
+   supports this ordering; UUID ties are stable across reads. No Article body or
+   author email/password hash/role is selected by these service queries.
+3. For authenticated viewers with a nonempty list, deduplicate author IDs and
+   run one parameterized `Follow` lookup using `followerId = viewerId` and
+   `followingId IN (...)`. Select only following IDs (TypeORM may also select the
+   Follow primary key for hydration). Build a Set for pure response mapping.
+   Anonymous and empty lists skip this query.
+
+Thus the service uses **2 statements anonymously**, **3 for authenticated
+nonempty results**, and **2 for authenticated empty results**. The existing JWT
+strategy adds **1 User lookup** to authenticated HTTP requests, so actual HTTP
+totals are 2, 4 and 3 respectively. An unknown Article stops after the first
+service lookup. Redis commands are separate from SQL. Author hydration occurs
+in the Comment join; there are no per-Comment or per-author SQL queries. The
+anonymous mapper receives following=false; authenticated results reflect stored
+Follow direction, including multiple followed authors and subsequent unfollows.
+The batch is bounded to distinct authors in this Article's returned Comments.
+
+Get Comments matches the current RealWorld contract without pagination. Large
+Articles therefore have unbounded response/memory costs; the single Follow IN
+lookup also grows with distinct author count. Fixed SQL statement count does not
+bound result size. Article lookup, Comment retrieval and Follow metadata are
+separate reads, so concurrent deletions or relationship changes may become visible
+between them; no snapshot transaction or pessimistic lock is introduced.
+
+Unexpected retrieval failures return a sanitized 500 using
+`comments.RETRIEVAL_FAILED` (English/Vietnamese). Creation and retrieval share a
+small existing-style private error handler: safe Logger metadata, original cause
+attached server-side, and no raw SQL/request contents in logs or responses.
+Expected 404s are preserved without unexpected-error logging.
 
 ## Authentication, races and errors
 
@@ -108,12 +190,14 @@ No SQL blocks or profile-query helpers are copied from ArticlesService.
   The original error remains attached as the exception's server-side cause;
   clients receive no SQL details, stack traces or filesystem paths.
 
-`comments.json` provides English and Vietnamese Article-not-found and creation
-failure messages. Existing language resolvers support `?lang=vi`, `x-lang` and
+`comments.json` provides English and Vietnamese Article-not-found, creation and
+retrieval failure messages. Existing language resolvers support `?lang=vi`, `x-lang` and
 Accept-Language. Validation and authentication retain their established error
 messages and status conventions. Swagger at `/docs` (`/docs-json`) documents the
 POST operation, nested body, Bearer auth, slug, public response and
-201/400/401/404/500/503 statuses.
+201/400/401/404/500/503 statuses. GET documents optional authentication, the slug,
+ordering, no pagination, shared Multiple Comments response and
+200/401/404/500/503 statuses. DELETE is not documented as implemented.
 
 ## Verification and limits
 
@@ -121,12 +205,12 @@ Run with Node.js 26.13.0 against the migrated isolated test services:
 
 ```powershell
 npm.cmd test -- --runInBand src/comments
-npm.cmd run test:e2e -- --runInBand comments.e2e-spec.ts
+npm.cmd run test:e2e -- --runInBand comments.e2e-spec.ts --cacheDirectory=./node_modules/.cache/jest-pr5
 npm.cmd run format
 npm.cmd run lint
 npm.cmd run build
 npm.cmd test -- --runInBand
-npm.cmd run test:e2e -- --runInBand
+npm.cmd run test:e2e -- --runInBand --cacheDirectory=./node_modules/.cache/jest-pr5
 git diff --check
 ```
 
@@ -142,9 +226,22 @@ Swagger. Cleanup targets only test-created users/records and revocation keys.
 Run E2E suites serially because existing database tests roundtrip migrations.
 No development or production database is used.
 
+Commit 3 adds unit coverage for empty/unknown/scoped retrieval, SQL ordering,
+deduplicated batch following, anonymous metadata, fixed calls for repeated authors,
+and sanitized failures at each query stage. Shared-profile mapper and affected
+Article/Profile behavior have regression coverage. GET E2E tests cover multi-author
+isolation, timestamp ties across repeated reads, follow/unfollow behavior, optional
+auth and Redis failure, private-field exclusion, translated errors and Swagger.
+SQL instrumentation checks actual statement counts for 1 and 20 Comments, no
+per-author queries, selected columns and skipped Follow work for empty lists.
+
+The previous C: disk exhaustion has been resolved and terminal execution is
+available. E2E runs explicitly place Jest's disposable cache on D: inside ignored
+`node_modules/.cache/jest-pr5`; no application configuration changes are needed.
+Report the actual command exit codes as well as test counts.
+
 Creation is not idempotent. If the INSERT commits but timestamp loading or response
 delivery fails, a retry may create another Comment. A concurrent deletion after
 the INSERT can also remove the new Comment through the existing cascade before
 the response is delivered. No transaction or speculative locking is introduced
-to guarantee continued existence after creation. Batch following lookup and
-shared profile-helper work remain for the Get Comments checkpoint.
+to guarantee continued existence after creation.

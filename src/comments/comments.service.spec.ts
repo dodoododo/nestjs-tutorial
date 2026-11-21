@@ -4,10 +4,11 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { I18nService } from 'nestjs-i18n';
-import { DataSource, QueryFailedError } from 'typeorm';
+import { DataSource, In, QueryFailedError } from 'typeorm';
 import { Article } from '../database/entities/article.entity';
 import { Comment } from '../database/entities/comment.entity';
 import { User } from '../database/entities/user.entity';
+import { Follow } from '../database/entities/follow.entity';
 import { CommentsService } from './comments.service';
 
 describe('CommentsService', () => {
@@ -33,12 +34,41 @@ describe('CommentsService', () => {
     createdAt: new Date('2026-01-01T00:00:00.123Z'),
     updatedAt: new Date('2026-01-01T00:00:00.123Z'),
   };
+  const query = {
+    innerJoin: jest.fn(),
+    select: jest.fn(),
+    where: jest.fn(),
+    orderBy: jest.fn(),
+    addOrderBy: jest.fn(),
+    getMany: jest.fn(),
+  };
+  const listed = [
+    {
+      ...saved,
+      createdAt: new Date('2026-01-02T00:00:00.123Z'),
+      author: profile,
+    },
+    {
+      ...saved,
+      id: '00000000-0000-4000-8000-000000000002',
+      author: {
+        ...profile,
+        id: 'other-author',
+        username: 'other',
+        bio: 'Bio',
+        image: '/avatar.png',
+      },
+    },
+    { ...saved, id: '00000000-0000-4000-8000-000000000001', author: profile },
+  ];
   const manager = {
     findOne: jest.fn(),
     save: jest.fn(),
     existsBy: jest.fn(),
     update: jest.fn(),
     transaction: jest.fn(),
+    createQueryBuilder: jest.fn(),
+    find: jest.fn(),
   };
   let service: CommentsService;
   let log: jest.SpyInstance;
@@ -59,6 +89,17 @@ describe('CommentsService', () => {
     );
     manager.save.mockResolvedValue(saved);
     manager.existsBy.mockResolvedValue(true);
+    for (const method of [
+      'innerJoin',
+      'select',
+      'where',
+      'orderBy',
+      'addOrderBy',
+    ] as const)
+      query[method].mockReturnThis();
+    query.getMany.mockResolvedValue(listed);
+    manager.createQueryBuilder.mockReturnValue(query);
+    manager.find.mockResolvedValue([{ followingId: 'other-author' }]);
     log = jest
       .spyOn(Logger.prototype, 'error')
       .mockImplementation(() => undefined);
@@ -68,6 +109,179 @@ describe('CommentsService', () => {
     );
   });
   afterEach(() => jest.restoreAllMocks());
+
+  describe('getComments', () => {
+    it('scopes the joined public projection to the resolved Article and delegates stable ordering to SQL', async () => {
+      const result = await service.getComments(article.slug);
+      expect(manager.findOne).toHaveBeenCalledWith(Article, {
+        where: { slug: article.slug },
+        select: { id: true },
+      });
+      expect(manager.createQueryBuilder).toHaveBeenCalledWith(
+        Comment,
+        'comment',
+      );
+      expect(query.innerJoin).toHaveBeenCalledWith('comment.author', 'author');
+      expect(query.select).toHaveBeenCalledWith([
+        'comment.id',
+        'comment.body',
+        'comment.createdAt',
+        'comment.updatedAt',
+        'author.id',
+        'author.username',
+        'author.bio',
+        'author.image',
+      ]);
+      expect(query.where).toHaveBeenCalledWith(
+        'comment.articleId = :articleId',
+        { articleId: article.id },
+      );
+      expect(query.orderBy).toHaveBeenCalledWith('comment.createdAt', 'DESC');
+      expect(query.addOrderBy).toHaveBeenCalledWith('comment.id', 'DESC');
+      expect(result).toEqual({
+        comments: listed.map((comment) => ({
+          id: comment.id,
+          body: comment.body,
+          createdAt: comment.createdAt.toISOString(),
+          updatedAt: comment.updatedAt.toISOString(),
+          author: {
+            username: comment.author.username,
+            bio: comment.author.bio,
+            image: comment.author.image,
+            following: false,
+          },
+        })),
+      });
+      expect(manager.find).not.toHaveBeenCalled();
+      expect(manager.save).not.toHaveBeenCalled();
+      expect(manager.update).not.toHaveBeenCalled();
+    });
+
+    it.each([undefined, 'viewer-id'])(
+      'returns an empty array without a Follow query for viewer %s',
+      async (viewerId) => {
+        query.getMany.mockResolvedValueOnce([]);
+        expect(await service.getComments(article.slug, viewerId)).toEqual({
+          comments: [],
+        });
+        expect(manager.find).not.toHaveBeenCalled();
+      },
+    );
+
+    it('returns a localized 404 before loading Comments for an unknown Article', async () => {
+      manager.findOne.mockResolvedValueOnce(null);
+      await expect(
+        service.getComments('unknown', 'viewer-id'),
+      ).rejects.toMatchObject({
+        status: 404,
+        message: 'comments.ARTICLE_NOT_FOUND',
+      });
+      expect(manager.createQueryBuilder).not.toHaveBeenCalled();
+      expect(manager.find).not.toHaveBeenCalled();
+      expect(log).not.toHaveBeenCalled();
+    });
+
+    it('loads only followed IDs in one parameterized, deduplicated batch for this viewer', async () => {
+      const result = await service.getComments(article.slug, 'viewer-id');
+      expect(manager.find).toHaveBeenCalledTimes(1);
+      expect(manager.find).toHaveBeenCalledWith(Follow, {
+        where: {
+          followerId: 'viewer-id',
+          followingId: In([authorId, 'other-author']),
+        },
+        select: { followingId: true },
+      });
+      expect(
+        result.comments.map((comment) => comment.author.following),
+      ).toEqual([false, true, false]);
+    });
+
+    it('maps all matching authors as followed and does not consult relationships for anonymous viewers', async () => {
+      manager.find.mockResolvedValueOnce([
+        { followingId: authorId },
+        { followingId: 'other-author' },
+      ]);
+      expect(
+        (await service.getComments(article.slug, 'viewer-id')).comments.every(
+          (comment) => comment.author.following,
+        ),
+      ).toBe(true);
+      manager.find.mockClear();
+      expect(
+        (await service.getComments(article.slug)).comments.every(
+          (comment) => !comment.author.following,
+        ),
+      ).toBe(true);
+      expect(manager.find).not.toHaveBeenCalled();
+    });
+
+    it('keeps query calls constant for twenty comments sharing an author, including mapping', async () => {
+      query.getMany.mockResolvedValueOnce(
+        Array.from({ length: 20 }, (_, index) => ({
+          ...listed[0],
+          id: String(index),
+        })),
+      );
+      const result = await service.getComments(article.slug, 'viewer-id');
+      expect(result.comments).toHaveLength(20);
+      expect(manager.findOne).toHaveBeenCalledTimes(1);
+      expect(query.getMany).toHaveBeenCalledTimes(1);
+      expect(manager.find).toHaveBeenCalledTimes(1);
+      expect(manager.find).toHaveBeenCalledWith(Follow, {
+        where: { followerId: 'viewer-id', followingId: In([authorId]) },
+        select: { followingId: true },
+      });
+    });
+
+    it.each(['article lookup', 'comment query', 'follow query'])(
+      'sanitizes database errors in %s and preserves their diagnostic cause',
+      async (step) => {
+        const cause = failure('ER_BAD_FIELD_ERROR');
+        if (step === 'article lookup')
+          manager.findOne.mockRejectedValueOnce(cause);
+        if (step === 'comment query')
+          query.getMany.mockRejectedValueOnce(cause);
+        if (step === 'follow query') manager.find.mockRejectedValueOnce(cause);
+        let caught: unknown;
+        try {
+          await service.getComments(article.slug, 'viewer-id');
+        } catch (error) {
+          caught = error;
+        }
+        expect(caught).toMatchObject({
+          status: 500,
+          cause,
+          message: 'comments.RETRIEVAL_FAILED',
+        });
+        expect(
+          JSON.stringify(
+            (caught as InternalServerErrorException).getResponse(),
+          ),
+        ).not.toMatch(/SQL|private|stack|constraint|query/i);
+        expect(log).toHaveBeenCalledWith('Comment retrieval failed', {
+          errorType: 'QueryFailedError',
+          code: 'ER_BAD_FIELD_ERROR',
+        });
+        expect(JSON.stringify(log.mock.calls)).not.toMatch(
+          /SQL|private|body|password|token/i,
+        );
+      },
+    );
+
+    it('sanitizes unexpected non-database errors too', async () => {
+      const cause = new Error('private request content');
+      query.getMany.mockRejectedValueOnce(cause);
+      await expect(service.getComments(article.slug)).rejects.toMatchObject({
+        status: 500,
+        cause,
+        message: 'comments.RETRIEVAL_FAILED',
+      });
+      expect(log).toHaveBeenCalledWith('Comment retrieval failed', {
+        errorType: 'Error',
+        code: undefined,
+      });
+    });
+  });
 
   it('looks up the current slug, persists only principal identity and body, and returns the public contract', async () => {
     const dto = {
