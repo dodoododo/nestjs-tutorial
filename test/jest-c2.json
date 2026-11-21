@@ -1,0 +1,12 @@
+{
+  "moduleFileExtensions": ["js", "json", "ts"],
+  "rootDir": ".",
+  "testEnvironment": "node",
+  "testMatch": ["<rootDir>/c2/**/*.c2-e2e.ts"],
+  "setupFiles": ["<rootDir>/c2/setup-environment.ts"],
+  "cacheDirectory": "<rootDir>/../node_modules/.cache/jest-c2",
+  "testTimeout": 30000,
+  "transform": {
+    "^.+\\.(t|j)s$": "ts-jest"
+  }
+}
