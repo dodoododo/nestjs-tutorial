@@ -1,5 +1,6 @@
 {
   "NOT_FOUND": "Không tìm thấy bài viết",
+  "NOT_AUTHOR": "Chỉ tác giả mới có thể sửa hoặc xóa bài viết này",
   "SLUG_CONFLICT": "Đã có bài viết với tiêu đề tương đương; vui lòng chọn tiêu đề khác",
   "PERSISTENCE_FAILED": "Không thể lưu hoặc truy xuất bài viết"
 }

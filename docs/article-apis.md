@@ -1,6 +1,7 @@
-# PR4 Commit 2: create and retrieve articles
+# PR4 article APIs: Commits 2 and 3
 
-Only `POST /api/articles` and `GET /api/articles/:slug` are added. Schema,
+Commit 2 adds `POST /api/articles` and `GET /api/articles/:slug`. Commit 3 adds
+`PUT /api/articles/:slug` and `DELETE /api/articles/:slug`. Schema,
 migrations, `synchronize: false`, and the existing authentication implementation
 remain unchanged. The request and single-article response follow the
 [RealWorld contract](https://realworld-docs.netlify.app/specifications/backend/endpoints/).
@@ -37,7 +38,7 @@ For example, `Đường đi!` and `DUONG DI` both become `duong-di`. There is no
 automatic numeric suffix: a slug already occupied under MySQL's collation
 returns localized **409 Conflict**, and the caller must change the title. This
 also applies to fallback and truncation collisions. The unique database index
-decides the winner of simultaneous creates. Existing articles are never updated.
+decides the winner of simultaneous creates. A create never overwrites an existing article.
 The service translates only violations of the named article slug index to 409.
 
 ## Tags and atomic persistence
@@ -56,7 +57,7 @@ inserted into `article_tags`; its composite primary key enforces relationship
 uniqueness. There are no cascade saves or per-tag queries. The returned tag list
 uses stored canonical names in database name order.
 
-MySQL deadlocks retry the entire transaction at most three times. Any failed
+MySQL deadlocks retry the entire transaction for at most three total attempts. Any failed
 transaction rolls back the article, new tags, and associations. Unexpected query
 failures retain their stack/cause in server logs and return an article-specific
 localized 500 without SQL or driver details; other exceptions are rethrown.
@@ -78,6 +79,79 @@ and metadata. It formats dates and explicitly maps the public author fields; it
 has no repositories or queries and returns no internal IDs, email, hashes, or
 tokens. Its per-article input/output types can support later list/feed mapping.
 
+## Update Article (Commit 3)
+
+`PUT /api/articles/:slug` requires the existing JWT guard and Redis revocation
+check. It looks up the URL slug, returns 404 if absent and 403 if the authenticated
+principal is not the author. Ownership is never taken from request fields.
+Supplied invalid/expired/revoked credentials return 401; a Redis outage remains
+fail-closed (503) before any article write.
+
+The nested `article` object is required. Only `title`, `description`, and `body`
+are allowed, all optional. `UpdateArticleDto` uses Swagger `PickType` and
+`PartialType` to inherit Create's validation and transformation rules, with
+`skipNullProperties: false` so null is rejected rather than treated as omission.
+The same normalized character limits, Unicode checks, nonblank body rule, and
+65,535 UTF-8 byte limit apply. `tagList`, author/UUID fields, slug, and other
+unknown properties return 400. Omitted fields are preserved. `{ "article": {} }`
+returns the current article with 200 after ownership checks, without issuing an
+UPDATE or changing its timestamps.
+
+A changed title regenerates the slug with the existing utility. An unchanged
+title (after trimming), or an update to only description/body, keeps the current
+slug, including a previously stored custom slug. The collision precheck uses
+MySQL collation and excludes the article's own UUID; a case/accent-equivalent
+value belonging to the same article is allowed. A genuinely conflicting slug
+returns localized 409. The unique index independently handles races after a
+successful precheck, also returning 409 instead of overwriting another article.
+
+The article UUID, author, creation timestamp, tag links, and favorites survive a
+slug change. The response reuses the existing Single Article DTO and pure
+mapper, including stored favorite counts and viewer-specific metadata. After
+renaming, the new slug resolves; a distinct old slug returns 404. Slug lookup
+continues to follow MySQL's case/accent-insensitive collation, so equivalent
+spellings can still resolve naturally. There are no aliases or redirects.
+
+## Mutation transactions and concurrency
+
+Update and delete use short `READ COMMITTED` transactions and a minimal
+`SELECT ... FOR UPDATE` projection of the target article. This serializes
+mutations to that resource and holds the ownership check valid through the
+write. Writes also include both UUID and principal author ID in their criteria.
+All queries use the transaction manager; no Redis locks or external calls occur
+inside the transaction. Update loads its response before commit, so any write
+or response-query failure rolls back the update.
+
+Only supplied fields are written: simultaneous description/body updates preserve
+both changes. Simultaneous writes to the same field use the last successful
+serialized write. If another mutation first removes or changes a distinct URL
+slug, a waiting request for that old slug returns 404. Slug prechecks do not
+reserve a name; the database constraint arbitrates competing articles.
+Deadlocks retry from a fresh transaction and ownership read, bounded to three
+total attempts. Persistent unexpected database failures use the existing
+sanitized article error, with a single server log preserving the stack/cause.
+Expected 403/404/409 errors and non-query exceptions are propagated unchanged.
+
+## Delete Article (Commit 3)
+
+`DELETE /api/articles/:slug` has the same authentication, existence, and author
+checks, then deletes only that UUID and owner. Success returns **204 No Content**
+with no response body; a repeated deletion returns **404**. Concurrent deletes
+produce one success and subsequent 404s. Concurrent update/delete requests do
+not recreate the article after deletion.
+
+MySQL's existing `ON DELETE CASCADE` foreign keys remove `article_tags` and
+`article_favorites` in the same transaction. The service does not manually
+delete these children. Reusable Tag rows, users, unrelated articles, and their
+relationships remain intact.
+
+There is no Comment entity/table yet. PR5 must reference the stable article UUID
+and define its deletion foreign key policy. Polymorphic `attachments` contain
+an `attachable_type`/`attachable_id` pair without a resource foreign key. Future
+article attachments will therefore need an explicit cleanup policy; this
+checkpoint does not introduce article attachment operations or speculative
+cleanup of those records.
+
 ## Verification
 
 Unit tests cover validation, Unicode/byte boundaries, slug normalization and
@@ -86,6 +160,14 @@ error classification, and fixed read counts. Article E2E tests cover the HTTP
 contract, ownership, JWT/Redis behavior, collation-equivalent and concurrent
 shared tags, simultaneous slug collisions, stored favorite/follow state, and
 rollback after article, tag, or relationship persistence failures.
+
+Commit 3 adds shared Create/Update validation checks, author-only mutations,
+partial/empty updates, slug changes and collation-equivalent collisions,
+database-level slug races synchronized after both prechecks, disjoint updates,
+concurrent delete/update handling, preserved tag/favorite metadata, empty 204
+responses, and rollback of both writes and deletion cascades after injected
+persistence failures. Swagger tests verify only Create/Get/Update/Delete are
+exposed, with Update accepting exactly its three optional fields.
 
 E2E fixtures refuse writes outside `127.0.0.1:3308/nestjs_tutorial_test` and require
 the test Redis instance at `127.0.0.1:6380`. Cleanup removes only fixture users,

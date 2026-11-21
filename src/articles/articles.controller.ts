@@ -1,9 +1,13 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
+  HttpCode,
+  HttpStatus,
   Param,
   Post,
+  Put,
   UseGuards,
   UsePipes,
   ValidationPipe,
@@ -13,6 +17,8 @@ import {
   ApiBearerAuth,
   ApiConflictResponse,
   ApiCreatedResponse,
+  ApiForbiddenResponse,
+  ApiNoContentResponse,
   ApiNotFoundResponse,
   ApiOkResponse,
   ApiOperation,
@@ -27,6 +33,7 @@ import type { AuthenticatedPrincipal } from '../auth/interfaces/authenticated-re
 import { ArticlesService } from './articles.service';
 import { ArticleResponseDto } from './dto/article-response.dto';
 import { CreateArticleRequestDto } from './dto/create-article.dto';
+import { UpdateArticleRequestDto } from './dto/update-article.dto';
 
 @ApiTags('Articles')
 @ApiUnauthorizedResponse({
@@ -79,5 +86,59 @@ export class ArticlesController {
     @CurrentUser() principal: AuthenticatedPrincipal | undefined,
   ): Promise<ArticleResponseDto> {
     return this.articles.getArticle(slug, principal?.user.id);
+  }
+
+  @Put(':slug')
+  @UseGuards(JwtAuthGuard)
+  @UsePipes(
+    new ValidationPipe({
+      transform: true,
+      whitelist: true,
+      forbidNonWhitelisted: true,
+    }),
+  )
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Update an article owned by the current user',
+    description:
+      'Omitted fields are preserved. An empty article object is a no-op. Changing the title regenerates the slug. Tag updates are not accepted.',
+  })
+  @ApiOkResponse({ type: ArticleResponseDto })
+  @ApiBadRequestResponse({
+    description: 'Invalid article input or unknown fields',
+  })
+  @ApiForbiddenResponse({
+    description: 'Only the article author may update it',
+  })
+  @ApiNotFoundResponse({ description: 'Article not found' })
+  @ApiConflictResponse({
+    description: 'An equivalent article slug already exists',
+  })
+  update(
+    @Param('slug') slug: string,
+    @Body() body: UpdateArticleRequestDto,
+    @CurrentUser() principal: AuthenticatedPrincipal,
+  ): Promise<ArticleResponseDto> {
+    return this.articles.updateArticle(slug, body.article, principal.user.id);
+  }
+
+  @Delete(':slug')
+  @UseGuards(JwtAuthGuard)
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Delete an article owned by the current user',
+    description: 'Returns 204 with no body. A repeated deletion returns 404.',
+  })
+  @ApiNoContentResponse({ description: 'Article deleted' })
+  @ApiForbiddenResponse({
+    description: 'Only the article author may delete it',
+  })
+  @ApiNotFoundResponse({ description: 'Article not found' })
+  delete(
+    @Param('slug') slug: string,
+    @CurrentUser() principal: AuthenticatedPrincipal,
+  ): Promise<void> {
+    return this.articles.deleteArticle(slug, principal.user.id);
   }
 }

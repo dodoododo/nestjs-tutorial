@@ -30,8 +30,9 @@ import {
 } from '../src/redis/redis.constant';
 import { RedisService } from '../src/redis/redis.service';
 import { setupSwagger } from '../src/swagger';
+import { articleSlug } from '../src/articles/utils/article-slug.util';
 
-describe('Create and get article APIs (e2e)', () => {
+describe('Article APIs (e2e)', () => {
   let app: INestApplication;
   let dataSource: DataSource;
   let users: Repository<User>;
@@ -78,6 +79,29 @@ describe('Create and get article APIs (e2e)', () => {
   async function create(overrides: Record<string, unknown> = {}) {
     const response = await post(input(overrides)).expect(201);
     return (response.body as ArticleResponseDto).article;
+  }
+
+  function mutate(
+    method: 'put' | 'delete',
+    slug: string,
+    article: unknown = {},
+    authorization: string | null = `Bearer ${token}`,
+  ) {
+    const req = request(app.getHttpServer())[method](
+      `/api/articles/${encodeURIComponent(slug)}`,
+    );
+    if (authorization !== null) req.set('Authorization', authorization);
+    return method === 'put' ? req.send({ article }) : req;
+  }
+
+  function authenticatedRequest(
+    method: 'post' | 'get' | 'put' | 'delete',
+    slug: string,
+    authorization = `Bearer ${token}`,
+  ) {
+    if (method === 'post') return post(input(), authorization);
+    if (method === 'get') return get(slug, authorization);
+    return mutate(method, slug, { body: 'Changed' }, authorization);
   }
 
   beforeAll(async () => {
@@ -185,7 +209,7 @@ describe('Create and get article APIs (e2e)', () => {
     expect(await articles.countBy({ authorId: author.id })).toBe(0);
   });
 
-  it.each(['post', 'get'] as const)(
+  it.each(['post', 'get', 'put', 'delete'] as const)(
     '%s rejects invalid, expired, incorrectly signed and revoked JWTs',
     async (method) => {
       const article = await create();
@@ -206,11 +230,9 @@ describe('Create and get article APIs (e2e)', () => {
         `Bearer ${expired}`,
         `Bearer ${incorrect}`,
       ]) {
-        await (
-          method === 'post'
-            ? post(input(), credential)
-            : get(article.slug, credential)
-        ).expect(401);
+        await authenticatedRequest(method, article.slug, credential).expect(
+          401,
+        );
       }
       const { jti } = await jwt.verifyAsync<{ jti: string }>(token);
       revocationKeys.push(`${REVOCATION_KEY_PREFIX}${jti}`);
@@ -218,23 +240,19 @@ describe('Create and get article APIs (e2e)', () => {
         .post('/api/logout')
         .set('Authorization', `Bearer ${token}`)
         .expect(204);
-      await (
-        method === 'post' ? post(input()) : get(article.slug, `Bearer ${token}`)
-      ).expect(401);
+      await authenticatedRequest(method, article.slug).expect(401);
       expect(await articles.countBy({ authorId: author.id })).toBe(1);
     },
   );
 
-  it.each(['post', 'get'] as const)(
+  it.each(['post', 'get', 'put', 'delete'] as const)(
     '%s fails closed when Redis is unavailable',
     async (method) => {
       const article = await create();
       jest
         .spyOn(app.get(RedisService), 'isTokenRevoked')
         .mockRejectedValueOnce(new ServiceUnavailableException());
-      await (
-        method === 'post' ? post(input()) : get(article.slug, `Bearer ${token}`)
-      ).expect(503);
+      await authenticatedRequest(method, article.slug).expect(503);
       expect(await articles.countBy({ authorId: author.id })).toBe(1);
     },
   );
@@ -485,7 +503,459 @@ describe('Create and get article APIs (e2e)', () => {
     expect(await articles.countBy({ authorId: author.id })).toBe(0);
   });
 
-  it('documents only the two article endpoints and their DTOs', async () => {
+  describe('update and delete authorization', () => {
+    it.each(['put', 'delete'] as const)(
+      '%s requires authentication, ownership and an existing resource',
+      async (method) => {
+        const article = await create();
+        const strangerToken = await app
+          .get(JwtService)
+          .signAsync({ sub: viewer.id, jti: randomUUID() });
+        await mutate(method, article.slug, {}, null).expect(401);
+        const forbidden = await mutate(
+          method,
+          article.slug,
+          {},
+          `Bearer ${strangerToken}`,
+        ).expect(403);
+        expect(forbidden.body.message).toBe(
+          'Only the article author may modify or delete this article',
+        );
+        await mutate(method, `missing-${prefix}`).expect(404);
+        expect((await get(article.slug).expect(200)).body.article).toEqual(
+          article,
+        );
+      },
+    );
+
+    it('translates ownership failures', async () => {
+      const article = await create();
+      const strangerToken = await app
+        .get(JwtService)
+        .signAsync({ sub: viewer.id, jti: randomUUID() });
+      const response = await request(app.getHttpServer())
+        .put(`/api/articles/${article.slug}?lang=vi`)
+        .set('Authorization', `Bearer ${strangerToken}`)
+        .send({ article: {} })
+        .expect(403);
+      expect(response.body.message).toBe(
+        'Chỉ tác giả mới có thể sửa hoặc xóa bài viết này',
+      );
+    });
+  });
+
+  describe('update article', () => {
+    it('changes title/slug while preserving identity, ownership, tags, favorites and response metadata', async () => {
+      const article = await create({ tagList: [tag('a'), tag('b')] });
+      const stored = await articles.findOneByOrFail({ slug: article.slug });
+      await dataSource.getRepository(ArticleFavorite).insert([
+        { articleId: stored.id, userId: author.id },
+        { articleId: stored.id, userId: viewer.id },
+      ]);
+      // Another viewer's follow must not leak into the owner's update response.
+      await dataSource
+        .getRepository(Follow)
+        .insert({ followerId: viewer.id, followingId: author.id });
+      const title = `Đường đi mới ${prefix}`;
+      const response = await mutate('put', article.slug, {
+        title: `  ${title}  `,
+      }).expect(200);
+      const updated = (response.body as ArticleResponseDto).article;
+      expect(response.body).toEqual({
+        article: {
+          slug: `duong-di-moi-${prefix}`,
+          title,
+          description: article.description,
+          body: article.body,
+          tagList: article.tagList,
+          createdAt: article.createdAt,
+          updatedAt: expect.any(String),
+          favoritesCount: 2,
+          favorited: true,
+          author: {
+            username: author.username,
+            bio: null,
+            image: null,
+            following: false,
+          },
+        },
+      });
+      expect(await articles.findOneByOrFail({ id: stored.id })).toMatchObject({
+        slug: updated.slug,
+        authorId: author.id,
+      });
+      expect(
+        await dataSource
+          .getRepository(ArticleTag)
+          .countBy({ articleId: stored.id }),
+      ).toBe(2);
+      expect(
+        await dataSource
+          .getRepository(ArticleFavorite)
+          .countBy({ articleId: stored.id }),
+      ).toBe(2);
+      await get(article.slug).expect(404);
+      expect(
+        (await get(updated.slug, `Bearer ${token}`).expect(200)).body,
+      ).toEqual(response.body);
+      const viewerToken = await app
+        .get(JwtService)
+        .signAsync({ sub: viewer.id, jti: randomUUID() });
+      expect(
+        (await get(updated.slug, `Bearer ${viewerToken}`).expect(200)).body
+          .article.author.following,
+      ).toBe(true);
+    });
+
+    it.each([
+      { description: '  New description  ' },
+      { body: '  New body\n\n  preserved  ' },
+      { description: '  Both fields  ', body: 'Body changed too' },
+      {},
+    ])(
+      'preserves omitted fields and handles an empty update (case %#)',
+      async (changes) => {
+        const article = await create();
+        const stored = await articles.findOneByOrFail({ slug: article.slug });
+        const result = await mutate('put', article.slug, changes).expect(200);
+        expect(result.body.article).toEqual({
+          slug: article.slug,
+          title: article.title,
+          description: changes.description?.trim() ?? article.description,
+          body: changes.body ?? article.body,
+          tagList: article.tagList,
+          createdAt: article.createdAt,
+          updatedAt: Object.keys(changes).length
+            ? expect.any(String)
+            : article.updatedAt,
+          favorited: article.favorited,
+          favoritesCount: article.favoritesCount,
+          author: article.author,
+        });
+        expect((await articles.findOneByOrFail({ id: stored.id })).slug).toBe(
+          article.slug,
+        );
+      },
+    );
+
+    it('updates all three fields together', async () => {
+      const article = await create();
+      const title = `Changed ${prefix}`;
+      const result = await mutate('put', article.slug, {
+        title: ` ${title} `,
+        description: ' New description ',
+        body: '\nNew body\n',
+      }).expect(200);
+      expect(result.body.article).toMatchObject({
+        slug: `changed-${prefix}`,
+        title,
+        description: 'New description',
+        body: '\nNew body\n',
+      });
+    });
+
+    it('preserves a non-generated existing slug when the normalized title is unchanged', async () => {
+      const article = await create();
+      const customSlug = `custom-${prefix}`;
+      await articles.update({ slug: article.slug }, { slug: customSlug });
+      const result = await mutate('put', customSlug, {
+        title: ` ${article.title} `,
+      }).expect(200);
+      expect(result.body.article.slug).toBe(customSlug);
+    });
+
+    it('allows the same article to keep a database-equivalent slug', async () => {
+      const title = `Café ${prefix}`;
+      const article = await create({ title });
+      await articles.update({ slug: article.slug }, { slug: `CAFÉ-${prefix}` });
+      const result = await mutate('put', `CAFÉ-${prefix}`, {
+        title: `CAFE ${prefix}!`,
+      }).expect(200);
+      expect(result.body.article.slug).toBe(`cafe-${prefix}`);
+      expect(await articles.countBy({ authorId: author.id })).toBe(1);
+    });
+
+    it('returns 409 for another database-equivalent slug without persisting other fields', async () => {
+      const first = await create();
+      const occupied = await create();
+      await articles.update(
+        { slug: occupied.slug },
+        { slug: `CAFÉ-${prefix}` },
+      );
+      const before = await articles.findOneByOrFail({ slug: first.slug });
+      await mutate('put', first.slug, {
+        title: `cafe ${prefix}`,
+        description: 'must roll back',
+      }).expect(409);
+      expect(await articles.findOneByOrFail({ id: before.id })).toEqual(before);
+      expect((await get(`CAFÉ-${prefix}`).expect(200)).body.article.title).toBe(
+        occupied.title,
+      );
+    });
+
+    it('resolves simultaneous slug collisions through the unique index after both prechecks pass', async () => {
+      const first = await create();
+      const second = await create();
+      const title = `Collision ${prefix}`;
+      const exists = jest.spyOn(EntityManager.prototype, 'existsBy');
+      const original = exists.getMockImplementation()!;
+      let arrivals = 0;
+      let release!: () => void;
+      const barrier = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      exists.mockImplementation(async function (
+        this: EntityManager,
+        entity,
+        where,
+      ) {
+        const result = await original.call(this, entity, where);
+        if (entity === Article) {
+          arrivals++;
+          if (arrivals === 2) release();
+          await barrier;
+        }
+        return result;
+      });
+      const results = await Promise.all([
+        mutate('put', first.slug, { title }),
+        mutate('put', second.slug, { title }),
+      ]);
+      expect(
+        results.map((response) => response.status).sort((a, b) => a - b),
+      ).toEqual([200, 409]);
+      expect(arrivals).toBe(2);
+      expect(await articles.countBy({ slug: articleSlug(title) })).toBe(1);
+      expect(await articles.countBy({ authorId: author.id })).toBe(2);
+    });
+
+    it('serializes disjoint updates without losing omitted fields', async () => {
+      const article = await create();
+      await Promise.all([
+        mutate('put', article.slug, {
+          description: 'Description updated',
+        }).expect(200),
+        mutate('put', article.slug, { body: 'Body updated' }).expect(200),
+      ]);
+      const result = await get(article.slug).expect(200);
+      expect(result.body.article).toMatchObject({
+        title: article.title,
+        slug: article.slug,
+        description: 'Description updated',
+        body: 'Body updated',
+      });
+    });
+
+    it.each([
+      ...['title', 'description', 'body'].flatMap((field) =>
+        [null, 123, '', ' \n\t ', '\ud800'].map((value) => ({
+          [field]: value,
+        })),
+      ),
+      { title: 'a'.repeat(256) },
+      { description: 'a'.repeat(1025) },
+      { body: 'a'.repeat(65_536) },
+      { body: '€'.repeat(21_846) },
+      { body: '😀'.repeat(16_384) },
+      { tagList: [] },
+      { authorId: 'forged' },
+      { author: {} },
+      { id: 'forged' },
+      { slug: 'forged' },
+    ])(
+      'rejects invalid or unauthorized update fields (case %#)',
+      async (changes) => {
+        const article = await create();
+        await mutate('put', article.slug, changes).expect(400);
+        expect((await get(article.slug).expect(200)).body.article).toEqual(
+          article,
+        );
+      },
+    );
+
+    it.each([
+      {},
+      { article: null },
+      { article: [] },
+      { article: 'text' },
+      { article: {}, unexpected: true },
+    ])('rejects malformed update envelopes (case %#)', async (payload) => {
+      const article = await create();
+      await request(app.getHttpServer())
+        .put(`/api/articles/${article.slug}`)
+        .set('Authorization', `Bearer ${token}`)
+        .send(payload)
+        .expect(400);
+    });
+
+    it.each([
+      'a'.repeat(65_535),
+      '€'.repeat(21_845),
+      '😀'.repeat(16_383) + 'abc',
+    ])('roundtrips the updated UTF-8 byte boundary (case %#)', async (body) => {
+      const article = await create();
+      const result = await mutate('put', article.slug, { body }).expect(200);
+      expect(result.body.article.body).toBe(body);
+      expect((await get(article.slug).expect(200)).body.article.body).toBe(
+        body,
+      );
+    });
+
+    it('rolls back an update after a persistence failure following the database write', async () => {
+      const article = await create();
+      const before = await articles.findOneByOrFail({ slug: article.slug });
+      const update = jest.spyOn(EntityManager.prototype, 'update');
+      const original = update.getMockImplementation()!;
+      const log = jest
+        .spyOn(Logger.prototype, 'error')
+        .mockImplementation(() => undefined);
+      update.mockImplementation(async function (
+        this: EntityManager,
+        target,
+        criteria,
+        changes,
+      ) {
+        const result = await original.call(this, target, criteria, changes);
+        if (target === Article)
+          throw new QueryFailedError(
+            'private SQL',
+            [],
+            new Error('private update failure'),
+          );
+        return result;
+      });
+      const response = await mutate('put', article.slug, {
+        title: `Rollback ${prefix}`,
+        body: 'Changed',
+      }).expect(500);
+      expect(response.body.message).toBe(
+        'Unable to persist or retrieve the article',
+      );
+      expect(JSON.stringify(response.body)).not.toMatch(/private|SQL|auth/i);
+      expect(await articles.findOneByOrFail({ id: before.id })).toEqual(before);
+      expect(log).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('delete article', () => {
+    it('returns an empty 204, cascades links/favorites, preserves shared tags and unrelated records, then returns 404', async () => {
+      const name = tag('shared-delete');
+      const article = await create({ tagList: [name] });
+      const retained = await create({ tagList: [name] });
+      const stored = await articles.findOneByOrFail({ slug: article.slug });
+      const retainedBefore = await articles.findOneByOrFail({
+        slug: retained.slug,
+      });
+      await dataSource.getRepository(ArticleFavorite).insert([
+        { articleId: stored.id, userId: viewer.id },
+        { articleId: retainedBefore.id, userId: viewer.id },
+      ]);
+      const usersBefore = await users.find({
+        where: { id: In(userIds) },
+        order: { id: 'ASC' },
+      });
+      const response = await mutate('delete', article.slug).expect(204);
+      expect(response.text).toBe('');
+      expect(response.headers['content-type']).toBeUndefined();
+      expect(await articles.existsBy({ id: stored.id })).toBe(false);
+      expect(
+        await dataSource
+          .getRepository(ArticleTag)
+          .countBy({ articleId: stored.id }),
+      ).toBe(0);
+      expect(
+        await dataSource
+          .getRepository(ArticleFavorite)
+          .countBy({ articleId: stored.id }),
+      ).toBe(0);
+      expect(await tags.countBy({ name })).toBe(1);
+      expect(await articles.findOneByOrFail({ id: retainedBefore.id })).toEqual(
+        retainedBefore,
+      );
+      expect(
+        await dataSource
+          .getRepository(ArticleTag)
+          .countBy({ articleId: retainedBefore.id }),
+      ).toBe(1);
+      expect(
+        await dataSource
+          .getRepository(ArticleFavorite)
+          .countBy({ articleId: retainedBefore.id }),
+      ).toBe(1);
+      expect(
+        await users.find({ where: { id: In(userIds) }, order: { id: 'ASC' } }),
+      ).toEqual(usersBefore);
+      await get(article.slug).expect(404);
+      await mutate('delete', article.slug).expect(404);
+    });
+
+    it('allows exactly one simultaneous deletion', async () => {
+      const article = await create();
+      const results = await Promise.all(
+        Array.from({ length: 6 }, () => mutate('delete', article.slug)),
+      );
+      expect(
+        results.map((response) => response.status).sort((a, b) => a - b),
+      ).toEqual([204, 404, 404, 404, 404, 404]);
+    });
+
+    it('handles simultaneous update/delete without resurrecting an article', async () => {
+      const article = await create();
+      const [update, deletion] = await Promise.all([
+        mutate('put', article.slug, { body: 'Changed' }),
+        mutate('delete', article.slug),
+      ]);
+      expect([200, 404]).toContain(update.status);
+      expect(deletion.status).toBe(204);
+      await get(article.slug).expect(404);
+    });
+
+    it('rolls back article deletion and cascades after an unexpected persistence failure', async () => {
+      const article = await create({ tagList: [tag('rollback-delete')] });
+      const stored = await articles.findOneByOrFail({ slug: article.slug });
+      await dataSource
+        .getRepository(ArticleFavorite)
+        .insert({ articleId: stored.id, userId: viewer.id });
+      const deletion = jest.spyOn(EntityManager.prototype, 'delete');
+      const original = deletion.getMockImplementation()!;
+      const log = jest
+        .spyOn(Logger.prototype, 'error')
+        .mockImplementation(() => undefined);
+      deletion.mockImplementation(async function (
+        this: EntityManager,
+        target,
+        criteria,
+      ) {
+        const result = await original.call(this, target, criteria);
+        if (target === Article)
+          throw new QueryFailedError(
+            'private SQL',
+            [],
+            new Error('private delete failure'),
+          );
+        return result;
+      });
+      const response = await mutate('delete', article.slug).expect(500);
+      expect(response.body.message).toBe(
+        'Unable to persist or retrieve the article',
+      );
+      expect(JSON.stringify(response.body)).not.toMatch(/private|SQL|auth/i);
+      expect(await articles.findOneByOrFail({ id: stored.id })).toEqual(stored);
+      expect(
+        await dataSource
+          .getRepository(ArticleTag)
+          .countBy({ articleId: stored.id }),
+      ).toBe(1);
+      expect(
+        await dataSource
+          .getRepository(ArticleFavorite)
+          .countBy({ articleId: stored.id }),
+      ).toBe(1);
+      expect(log).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it('documents only the four article operations and their DTOs', async () => {
     const response = await request(app.getHttpServer())
       .get('/docs-json')
       .expect(200);
@@ -501,5 +971,25 @@ describe('Create and get article APIs (e2e)', () => {
       {},
       { bearer: [] },
     ]);
+    expect(
+      Object.keys(response.body.paths['/api/articles/{slug}']).sort(),
+    ).toEqual(['delete', 'get', 'put']);
+    expect(response.body.paths['/api/articles/{slug}'].put.security).toEqual([
+      { bearer: [] },
+    ]);
+    expect(
+      response.body.paths['/api/articles/{slug}'].delete.responses['204'],
+    ).toBeDefined();
+    expect(
+      response.body.paths['/api/articles/{slug}'].delete.responses['204']
+        .content,
+    ).toBeUndefined();
+    const updateSchema = response.body.components.schemas.UpdateArticleDto;
+    expect(Object.keys(updateSchema.properties).sort()).toEqual([
+      'body',
+      'description',
+      'title',
+    ]);
+    expect(updateSchema.required ?? []).toEqual([]);
   });
 });

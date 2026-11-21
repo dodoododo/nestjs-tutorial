@@ -1,5 +1,6 @@
 {
   "NOT_FOUND": "Article not found",
+  "NOT_AUTHOR": "Only the article author may modify or delete this article",
   "SLUG_CONFLICT": "An article with an equivalent title already exists; choose a different title",
   "PERSISTENCE_FAILED": "Unable to persist or retrieve the article"
 }

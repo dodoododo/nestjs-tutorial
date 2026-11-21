@@ -1,4 +1,9 @@
-import { ConflictException, Logger, NotFoundException } from '@nestjs/common';
+import {
+  ConflictException,
+  ForbiddenException,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
 import { I18nService } from 'nestjs-i18n';
 import { DataSource, QueryFailedError } from 'typeorm';
 import { Article } from '../database/entities/article.entity';
@@ -31,6 +36,10 @@ describe('ArticlesService', () => {
     insert: jest.fn(),
     query: jest.fn(),
     find: jest.fn(),
+    findOne: jest.fn(),
+    existsBy: jest.fn(),
+    update: jest.fn(),
+    delete: jest.fn(),
     createQueryBuilder: jest.fn(() => qb),
   };
   const transaction = jest.fn();
@@ -51,6 +60,15 @@ describe('ArticlesService', () => {
     manager.insert.mockResolvedValue({});
     manager.query.mockResolvedValue({});
     manager.find.mockResolvedValue([{ id: 'tag-id' }]);
+    manager.findOne.mockResolvedValue({
+      id: 'article-id',
+      authorId: 'author',
+      title: 'Title',
+      slug: 'title',
+    });
+    manager.existsBy.mockResolvedValue(false);
+    manager.update.mockResolvedValue({ affected: 1 });
+    manager.delete.mockResolvedValue({ affected: 1 });
     qb.getRawAndEntities.mockResolvedValue({
       entities: [loaded],
       raw: [{ favoritesCount: '3', favorited: '1', following: '1' }],
@@ -169,4 +187,175 @@ describe('ArticlesService', () => {
     expect(authenticated.article.author.following).toBe(true);
     expect(manager.createQueryBuilder).toHaveBeenCalledTimes(2);
   });
+
+  describe('updateArticle', () => {
+    it('locks the resource, scopes the write by ID/owner and regenerates only a changed title slug', async () => {
+      await service.updateArticle(
+        'title',
+        { title: 'Đường đi', description: 'Changed' },
+        'author',
+      );
+      expect(manager.findOne).toHaveBeenCalledWith(Article, {
+        where: { slug: 'title' },
+        select: { id: true, authorId: true, title: true, slug: true },
+        lock: { mode: 'pessimistic_write' },
+      });
+      expect(manager.existsBy).toHaveBeenCalledWith(
+        Article,
+        expect.objectContaining({ slug: 'duong-di', id: expect.anything() }),
+      );
+      expect(manager.update).toHaveBeenCalledWith(
+        Article,
+        { id: 'article-id', authorId: 'author' },
+        { title: 'Đường đi', slug: 'duong-di', description: 'Changed' },
+      );
+      expect(qb.where).toHaveBeenCalledWith('article.slug = :slug', {
+        slug: 'duong-di',
+      });
+      expect(manager.insert).not.toHaveBeenCalled();
+      expect(manager.delete).not.toHaveBeenCalled();
+    });
+
+    it('does not regenerate a historical/custom slug for an unchanged title', async () => {
+      manager.findOne.mockResolvedValueOnce({
+        id: 'article-id',
+        authorId: 'author',
+        title: 'Title',
+        slug: 'custom-slug',
+      });
+      await service.updateArticle(
+        'custom-slug',
+        { title: 'Title', body: 'Changed' },
+        'author',
+      );
+      expect(manager.update).toHaveBeenCalledWith(
+        Article,
+        { id: 'article-id', authorId: 'author' },
+        { body: 'Changed' },
+      );
+      expect(manager.existsBy).not.toHaveBeenCalled();
+      expect(qb.where).toHaveBeenCalledWith('article.slug = :slug', {
+        slug: 'custom-slug',
+      });
+    });
+
+    it('treats an empty update as a no-op after checking ownership', async () => {
+      const response = await service.updateArticle('title', {}, 'author');
+      expect(manager.update).not.toHaveBeenCalled();
+      expect(manager.findOne).toHaveBeenCalledTimes(1);
+      expect(response.article).toMatchObject({
+        tagList: ['nestjs'],
+        favoritesCount: 3,
+        favorited: true,
+        author: { following: true },
+      });
+    });
+
+    it('rejects an existing conflicting slug before writing', async () => {
+      manager.existsBy.mockResolvedValueOnce(true);
+      await expect(
+        service.updateArticle('title', { title: 'Other title' }, 'author'),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(manager.update).not.toHaveBeenCalled();
+    });
+
+    it('allows a changed title which normalizes to the same slug', async () => {
+      await service.updateArticle('title', { title: 'TITLE!' }, 'author');
+      expect(manager.existsBy).not.toHaveBeenCalled();
+      expect(manager.update).toHaveBeenCalledWith(
+        Article,
+        { id: 'article-id', authorId: 'author' },
+        { title: 'TITLE!', slug: 'title' },
+      );
+    });
+
+    it('turns a database slug collision after the precheck into 409', async () => {
+      manager.update.mockRejectedValueOnce(
+        failure('ER_DUP_ENTRY', 'IDX_articles_slug_unique'),
+      );
+      await expect(
+        service.updateArticle('title', { title: 'Other' }, 'author'),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(qb.getRawAndEntities).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('deleteArticle', () => {
+    it('deletes only the locked resource by UUID/owner and delegates cascades to MySQL', async () => {
+      await expect(
+        service.deleteArticle('title', 'author'),
+      ).resolves.toBeUndefined();
+      expect(transaction).toHaveBeenCalledWith(
+        'READ COMMITTED',
+        expect.any(Function),
+      );
+      expect(manager.delete).toHaveBeenCalledTimes(1);
+      expect(manager.delete).toHaveBeenCalledWith(Article, {
+        id: 'article-id',
+        authorId: 'author',
+      });
+      expect(manager.createQueryBuilder).not.toHaveBeenCalled();
+    });
+  });
+
+  describe.each(['update', 'delete'] as const)(
+    '%s ownership and failure handling',
+    (method) => {
+      const mutate = () =>
+        method === 'update'
+          ? service.updateArticle('title', { body: 'Changed' }, 'author')
+          : service.deleteArticle('title', 'author');
+
+      it('returns 404 for a missing resource without writing', async () => {
+        manager.findOne.mockResolvedValueOnce(null);
+        await expect(mutate()).rejects.toBeInstanceOf(NotFoundException);
+        expect(manager.update).not.toHaveBeenCalled();
+        expect(manager.delete).not.toHaveBeenCalled();
+      });
+
+      it('returns 403 for another author without writing', async () => {
+        manager.findOne.mockResolvedValueOnce({
+          id: 'article-id',
+          authorId: 'other',
+          title: 'Title',
+          slug: 'title',
+        });
+        await expect(mutate()).rejects.toBeInstanceOf(ForbiddenException);
+        expect(manager.update).not.toHaveBeenCalled();
+        expect(manager.delete).not.toHaveBeenCalled();
+      });
+
+      it('retries a deadlock from a fresh locked read', async () => {
+        manager[method].mockRejectedValueOnce(failure('ER_LOCK_DEADLOCK'));
+        await mutate();
+        expect(transaction).toHaveBeenCalledTimes(2);
+        expect(manager.findOne).toHaveBeenCalledTimes(2);
+      });
+
+      it('limits deadlock retries, logs once and preserves a sanitized error with its cause', async () => {
+        const cause = failure('ER_LOCK_DEADLOCK');
+        manager[method].mockRejectedValue(cause);
+        const log = jest
+          .spyOn(Logger.prototype, 'error')
+          .mockImplementation(() => undefined);
+        await expect(mutate()).rejects.toMatchObject({
+          status: 500,
+          message: 'articles.PERSISTENCE_FAILED',
+          cause,
+        });
+        expect(transaction).toHaveBeenCalledTimes(3);
+        expect(log).toHaveBeenCalledTimes(1);
+      });
+
+      it('preserves non-database errors without wrapping or duplicate logging', async () => {
+        const cause = new Error('unexpected');
+        const log = jest
+          .spyOn(Logger.prototype, 'error')
+          .mockImplementation(() => undefined);
+        manager[method].mockRejectedValueOnce(cause);
+        await expect(mutate()).rejects.toBe(cause);
+        expect(log).not.toHaveBeenCalled();
+      });
+    },
+  );
 });
