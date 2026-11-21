@@ -1,4 +1,5 @@
-import { INestApplication, Logger } from '@nestjs/common';
+import { Logger } from '@nestjs/common';
+import type { NestExpressApplication } from '@nestjs/platform-express';
 import { JwtService } from '@nestjs/jwt';
 import { Test } from '@nestjs/testing';
 import { OpenAPIObject } from '@nestjs/swagger';
@@ -19,6 +20,10 @@ import { CommentResponseDto } from '../src/comments/dto/comment-response.dto';
 import { CommentsResponseDto } from '../src/comments/dto/comments-response.dto';
 import { COMMENT_BODY_MAX_BYTES } from '../src/comments/constants/comment.constant';
 import { CommentsService } from '../src/comments/comments.service';
+import {
+  COMMENT_JSON_MAX_BYTES,
+  setupCommentBodyParser,
+} from '../src/comments/comment-body-parser';
 import { Article } from '../src/database/entities/article.entity';
 import { Comment } from '../src/database/entities/comment.entity';
 import { User } from '../src/database/entities/user.entity';
@@ -33,7 +38,7 @@ import {
 import { setupSwagger } from '../src/swagger';
 
 describe('Comment APIs (e2e)', () => {
-  let app: INestApplication;
+  let app: NestExpressApplication;
   let dataSource: DataSource;
   let redis: Redis;
   let users: Repository<User>;
@@ -113,6 +118,7 @@ describe('Comment APIs (e2e)', () => {
     }).compile();
     app = moduleRef.createNestApplication();
     app.setGlobalPrefix('api');
+    setupCommentBodyParser(app);
     setupSwagger(app);
     await app.init();
     dataSource = app.get(DataSource);
@@ -305,6 +311,9 @@ describe('Comment APIs (e2e)', () => {
     'a'.repeat(COMMENT_BODY_MAX_BYTES),
     '€'.repeat(21_845),
     '😀'.repeat(16_383) + 'abc',
+    'x' + '\n'.repeat(COMMENT_BODY_MAX_BYTES - 1),
+    '"'.repeat(COMMENT_BODY_MAX_BYTES),
+    '\u0000'.repeat(COMMENT_BODY_MAX_BYTES),
   ])('persists exactly 65535 UTF-8 bytes (case %#)', async (body) => {
     expect(Buffer.byteLength(body, 'utf8')).toBe(COMMENT_BODY_MAX_BYTES);
     const response = await post({ comment: { body } }).expect(201);
@@ -317,6 +326,7 @@ describe('Comment APIs (e2e)', () => {
     '€'.repeat(21_846),
     '😀'.repeat(16_384),
     'a'.repeat(COMMENT_BODY_MAX_BYTES) + ' ',
+    '\u0000'.repeat(COMMENT_BODY_MAX_BYTES + 1),
   ])(
     'rejects oversized UTF-8 bodies before persistence (case %#)',
     async (body) => {
@@ -324,6 +334,23 @@ describe('Comment APIs (e2e)', () => {
       expect(await ownCount()).toBe(0);
     },
   );
+
+  it('keeps the transport limit bounded and preserves the default limit on other routes and methods', async () => {
+    await post({
+      comment: { body: 'a'.repeat(COMMENT_JSON_MAX_BYTES) },
+    }).expect(413);
+    const payload = {
+      comment: { body: 'x' + '\n'.repeat(COMMENT_BODY_MAX_BYTES - 1) },
+    };
+    await request(app.getHttpServer())
+      .post('/api/articles')
+      .set('Authorization', `Bearer ${token}`)
+      .send(payload)
+      .expect(413);
+    await get().send(payload).expect(413);
+    await remove(randomUUID()).send(payload).expect(413);
+    expect(await ownCount()).toBe(0);
+  });
 
   it.each([
     null,
@@ -1231,6 +1258,7 @@ describe('Comment APIs (e2e)', () => {
       '400',
       '401',
       '404',
+      '413',
       '500',
       '503',
     ]);

@@ -1,4 +1,4 @@
-# PR5 Comment APIs: Commits 2–4
+# PR5 Comment APIs: Commits 2–5
 
 Commit 2 implements `POST /api/articles/:slug/comments`. Commit 3 adds
 `GET /api/articles/:slug/comments` with optional authentication and shared public
@@ -45,6 +45,16 @@ persistence, including whitespace. Multibyte text at that byte boundary succeeds
 larger input returns 400. Character-count validation cannot replace this check.
 These are the same body-validation principles already used by Create/Update
 Article; those DTOs remain unchanged.
+
+The final review corrected a transport boundary: JSON escaping can make valid
+65,535-byte text exceed Express's default 100 KB JSON limit. Before application
+initialization, `setupCommentBodyParser` registers a 400 KiB JSON parser only for
+POST Comments, followed by the default parser for other JSON requests. This
+allows even six-byte JSON escapes at the TEXT boundary; the DTO still enforces
+65,535 decoded UTF-8 bytes. Requests exceeding the transport cap return 413.
+Other routes and methods retain their existing transport limits. HTTP tests
+verify escaped line breaks, quotes, control characters, decoded-byte rejection
+and the unchanged limits outside POST Comments.
 
 ## Persistence and response
 
@@ -235,7 +245,7 @@ retrieval failure messages. Existing language resolvers support `?lang=vi`, `x-l
 Accept-Language. Validation and authentication retain their established error
 messages and status conventions. Swagger at `/docs` (`/docs-json`) documents the
 POST operation, nested body, Bearer auth, slug, public response and
-201/400/401/404/500/503 statuses. GET documents optional authentication, the slug,
+201/400/401/404/413/500/503 statuses. GET documents optional authentication, the slug,
 ordering, no pagination, shared Multiple Comments response and
 200/401/404/500/503 statuses. DELETE documents the author-only behavior above.
 

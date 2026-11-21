@@ -24,6 +24,7 @@ import {
   ApiNoContentResponse,
   ApiOperation,
   ApiOkResponse,
+  ApiPayloadTooLargeResponse,
   ApiParam,
   ApiServiceUnavailableResponse,
   ApiTags,
@@ -134,6 +135,9 @@ export class CommentsController {
   @ApiBadRequestResponse({
     description:
       'Invalid nested input, unknown fields, invalid Unicode or more than 65535 UTF-8 bytes',
+  })
+  @ApiPayloadTooLargeResponse({
+    description: 'JSON request exceeds the 400 KiB transport limit',
   })
   @ApiUnauthorizedResponse({
     description: 'Missing, invalid, expired or revoked JWT',
