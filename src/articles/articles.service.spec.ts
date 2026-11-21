@@ -12,6 +12,7 @@ import { ArticlesService } from './articles.service';
 import { ListArticlesQueryDto } from './dto/list-articles-query.dto';
 import { User } from '../database/entities/user.entity';
 import { Follow } from '../database/entities/follow.entity';
+import { ArticleFavorite } from '../database/entities/article-favorite.entity';
 import { FeedArticlesQueryDto } from './dto/feed-articles-query.dto';
 
 describe('ArticlesService', () => {
@@ -572,6 +573,180 @@ describe('ArticlesService', () => {
       expect(qb.getRawAndEntities).not.toHaveBeenCalled();
     });
   });
+
+  describe('favoriteArticle', () => {
+    it('uses the transaction manager, protects the article and inserts only the authenticated relationship', async () => {
+      const result = await service.favoriteArticle('title', 'viewer');
+      expect(transaction).toHaveBeenCalledWith(
+        'READ COMMITTED',
+        expect.any(Function),
+      );
+      expect(manager.findOne).toHaveBeenCalledWith(Article, {
+        where: { slug: 'title' },
+        select: { id: true, slug: true },
+        lock: { mode: 'pessimistic_read' },
+      });
+      expect(manager.insert).toHaveBeenCalledWith(ArticleFavorite, {
+        articleId: 'article-id',
+        userId: 'viewer',
+      });
+      expect(manager.existsBy).not.toHaveBeenCalled();
+      expect(manager.update).not.toHaveBeenCalled();
+      expect(manager.delete).not.toHaveBeenCalled();
+      expect(result.article).toMatchObject({
+        body: 'Body',
+        tagList: ['nestjs'],
+        favorited: true,
+        favoritesCount: 3,
+        author: { following: true },
+      });
+      expect(manager.createQueryBuilder).toHaveBeenCalledTimes(2);
+      expect(qb.setParameter).toHaveBeenCalledWith('viewerId', 'viewer');
+    });
+
+    it.each(['PRIMARY', 'article_favorites.PRIMARY'])(
+      'classifies only the favorite insert primary key conflict: %s',
+      async (key) => {
+        const log = jest
+          .spyOn(Logger.prototype, 'error')
+          .mockImplementation(() => undefined);
+        manager.insert.mockRejectedValueOnce(
+          failure('ER_DUP_ENTRY', `Duplicate entry 'ids' for key '${key}'`),
+        );
+        await expect(
+          service.favoriteArticle('title', 'viewer'),
+        ).rejects.toMatchObject({
+          status: 409,
+          message: 'articles.ALREADY_FAVORITED',
+        });
+        expect(transaction).toHaveBeenCalledTimes(1);
+        expect(log).not.toHaveBeenCalled();
+        expect(qb.getRawAndEntities).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([
+      ['ER_DUP_ENTRY', "Duplicate entry 'x' for key 'other.PRIMARY'"],
+      [
+        'ER_DUP_ENTRY',
+        "Duplicate entry 'x' for key 'article_favorites.unrelated_unique'",
+      ],
+      [
+        'ER_DUP_ENTRY',
+        "Duplicate entry 'x' for key 'articles.IDX_articles_slug_unique'",
+      ],
+      ['ER_DUP_ENTRY', 'missing constraint details'],
+      ['ER_NO_REFERENCED_ROW_2', "for key 'article_favorites.PRIMARY'"],
+      ['ER_BAD_FIELD_ERROR', 'driver details'],
+    ])(
+      'logs and sanitizes unrelated insert failure %s / %s',
+      async (code, message) => {
+        const cause = failure(code, message);
+        manager.insert.mockRejectedValueOnce(cause);
+        const log = jest
+          .spyOn(Logger.prototype, 'error')
+          .mockImplementation(() => undefined);
+        await expect(
+          service.favoriteArticle('title', 'viewer'),
+        ).rejects.toMatchObject({
+          status: 500,
+          message: 'articles.PERSISTENCE_FAILED',
+          cause,
+        });
+        expect(log).toHaveBeenCalledWith(
+          'Article persistence failed (favorite, articleId=article-id, userId=viewer)',
+          cause.stack,
+        );
+        expect(log).toHaveBeenCalledTimes(1);
+      },
+    );
+
+    it('does not classify a duplicate-key error from response retrieval as an existing favorite', async () => {
+      const cause = failure(
+        'ER_DUP_ENTRY',
+        "Duplicate entry 'ids' for key 'article_favorites.PRIMARY'",
+      );
+      qb.getRawAndEntities.mockRejectedValueOnce(cause);
+      jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+      await expect(
+        service.favoriteArticle('title', 'viewer'),
+      ).rejects.toMatchObject({ status: 500, cause });
+    });
+  });
+
+  describe('unfavoriteArticle', () => {
+    it.each([0, 1])(
+      'directly deletes by article and viewer and returns metadata when affected=%i',
+      async (affected) => {
+        manager.delete.mockResolvedValueOnce({ affected });
+        qb.getRawAndEntities.mockResolvedValueOnce({
+          entities: [loaded],
+          raw: [{ favoritesCount: '2', favorited: '0', following: '1' }],
+        });
+        const result = await service.unfavoriteArticle('title', 'viewer');
+        expect(manager.delete).toHaveBeenCalledWith(ArticleFavorite, {
+          articleId: 'article-id',
+          userId: 'viewer',
+        });
+        expect(manager.findOne).toHaveBeenCalledTimes(1);
+        expect(manager.existsBy).not.toHaveBeenCalled();
+        expect(manager.insert).not.toHaveBeenCalled();
+        expect(manager.update).not.toHaveBeenCalled();
+        expect(result.article).toMatchObject({
+          body: 'Body',
+          favoritesCount: 2,
+          favorited: false,
+          author: { following: true },
+        });
+        expect(manager.createQueryBuilder).toHaveBeenCalledTimes(2);
+      },
+    );
+  });
+
+  describe.each(['favorite', 'unfavorite'] as const)(
+    '%s failures and retries',
+    (operation) => {
+      const mutate = () =>
+        operation === 'favorite'
+          ? service.favoriteArticle('title', 'viewer')
+          : service.unfavoriteArticle('title', 'viewer');
+      const write = operation === 'favorite' ? 'insert' : 'delete';
+      it('returns article-specific 404 before writing or loading metadata', async () => {
+        manager.findOne.mockResolvedValueOnce(null);
+        await expect(mutate()).rejects.toMatchObject({
+          status: 404,
+          message: 'articles.NOT_FOUND',
+        });
+        expect(manager[write]).not.toHaveBeenCalled();
+        expect(qb.getRawAndEntities).not.toHaveBeenCalled();
+      });
+      it('retries a genuine deadlock from a fresh transaction and locked read', async () => {
+        manager[write].mockRejectedValueOnce(failure('ER_LOCK_DEADLOCK'));
+        await mutate();
+        expect(transaction).toHaveBeenCalledTimes(2);
+        expect(manager.findOne).toHaveBeenCalledTimes(2);
+      });
+      it('bounds deadlock retries and preserves the unexpected error cause', async () => {
+        const cause = failure('ER_LOCK_DEADLOCK');
+        manager[write].mockRejectedValue(cause);
+        const log = jest
+          .spyOn(Logger.prototype, 'error')
+          .mockImplementation(() => undefined);
+        await expect(mutate()).rejects.toMatchObject({
+          status: 500,
+          message: 'articles.PERSISTENCE_FAILED',
+          cause,
+        });
+        expect(transaction).toHaveBeenCalledTimes(3);
+        expect(log).toHaveBeenCalledTimes(1);
+      });
+      it('preserves non-query errors without wrapping them as persistence failures', async () => {
+        const cause = new Error('unexpected');
+        manager[write].mockRejectedValueOnce(cause);
+        await expect(mutate()).rejects.toBe(cause);
+      });
+    },
+  );
 
   describe('deleteArticle', () => {
     it('deletes only the locked resource by UUID/owner and delegates cascades to MySQL', async () => {

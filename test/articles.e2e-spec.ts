@@ -130,7 +130,15 @@ describe('Article APIs (e2e)', () => {
   }
 
   function authenticatedRequest(
-    method: 'post' | 'get' | 'put' | 'delete' | 'list' | 'feed',
+    method:
+      | 'post'
+      | 'get'
+      | 'put'
+      | 'delete'
+      | 'list'
+      | 'feed'
+      | 'favorite'
+      | 'unfavorite',
     slug: string,
     authorization = `Bearer ${token}`,
   ) {
@@ -138,7 +146,24 @@ describe('Article APIs (e2e)', () => {
     if (method === 'list') return list({}, authorization);
     if (method === 'feed') return feed({}, authorization);
     if (method === 'get') return get(slug, authorization);
+    if (method === 'favorite' || method === 'unfavorite')
+      return favorite(
+        method === 'favorite' ? 'post' : 'delete',
+        slug,
+        authorization,
+      );
     return mutate(method, slug, { body: 'Changed' }, authorization);
+  }
+  function favorite(
+    method: 'post' | 'delete',
+    slug: string,
+    authorization: string | null = `Bearer ${token}`,
+  ) {
+    const req = request(app.getHttpServer())[method](
+      `/api/articles/${encodeURIComponent(slug)}/favorite`,
+    );
+    if (authorization !== null) req.set('Authorization', authorization);
+    return req;
   }
 
   beforeAll(async () => {
@@ -246,7 +271,16 @@ describe('Article APIs (e2e)', () => {
     expect(await articles.countBy({ authorId: author.id })).toBe(0);
   });
 
-  it.each(['post', 'get', 'put', 'delete', 'list', 'feed'] as const)(
+  it.each([
+    'post',
+    'get',
+    'put',
+    'delete',
+    'list',
+    'feed',
+    'favorite',
+    'unfavorite',
+  ] as const)(
     '%s rejects invalid, expired, incorrectly signed and revoked JWTs',
     async (method) => {
       const article = await create();
@@ -282,17 +316,23 @@ describe('Article APIs (e2e)', () => {
     },
   );
 
-  it.each(['post', 'get', 'put', 'delete', 'list', 'feed'] as const)(
-    '%s fails closed when Redis is unavailable',
-    async (method) => {
-      const article = await create();
-      jest
-        .spyOn(app.get(RedisService), 'isTokenRevoked')
-        .mockRejectedValueOnce(new ServiceUnavailableException());
-      await authenticatedRequest(method, article.slug).expect(503);
-      expect(await articles.countBy({ authorId: author.id })).toBe(1);
-    },
-  );
+  it.each([
+    'post',
+    'get',
+    'put',
+    'delete',
+    'list',
+    'feed',
+    'favorite',
+    'unfavorite',
+  ] as const)('%s fails closed when Redis is unavailable', async (method) => {
+    const article = await create();
+    jest
+      .spyOn(app.get(RedisService), 'isTokenRevoked')
+      .mockRejectedValueOnce(new ServiceUnavailableException());
+    await authenticatedRequest(method, article.slug).expect(503);
+    expect(await articles.countBy({ authorId: author.id })).toBe(1);
+  });
 
   it('serves anonymous requests without Redis and returns translated 404', async () => {
     const article = await create();
@@ -1390,14 +1430,12 @@ describe('Article APIs (e2e)', () => {
       const records = await seedList(2);
       const names = [tag('one'), tag('two')];
       const storedTags = await tags.save(names.map((name) => ({ name })));
-      await dataSource
-        .getRepository(ArticleTag)
-        .insert(
-          storedTags.map((storedTag) => ({
-            articleId: records[0].id,
-            tagId: storedTag.id,
-          })),
-        );
+      await dataSource.getRepository(ArticleTag).insert(
+        storedTags.map((storedTag) => ({
+          articleId: records[0].id,
+          tagId: storedTag.id,
+        })),
+      );
       await dataSource.getRepository(ArticleFavorite).insert([
         { articleId: records[0].id, userId: viewer.id },
         { articleId: records[0].id, userId: other.id },
@@ -1527,24 +1565,20 @@ describe('Article APIs (e2e)', () => {
       const storedTags = await tags.save(
         [tag('one'), tag('two')].map((name) => ({ name })),
       );
-      await dataSource
-        .getRepository(ArticleTag)
-        .insert(
-          records.flatMap((article) =>
-            storedTags.map((storedTag) => ({
-              articleId: article.id,
-              tagId: storedTag.id,
-            })),
-          ),
-        );
-      await dataSource
-        .getRepository(ArticleFavorite)
-        .insert(
-          records.map((article) => ({
+      await dataSource.getRepository(ArticleTag).insert(
+        records.flatMap((article) =>
+          storedTags.map((storedTag) => ({
             articleId: article.id,
-            userId: viewer.id,
+            tagId: storedTag.id,
           })),
-        );
+        ),
+      );
+      await dataSource.getRepository(ArticleFavorite).insert(
+        records.map((article) => ({
+          articleId: article.id,
+          userId: viewer.id,
+        })),
+      );
       await dataSource
         .getRepository(Follow)
         .insert({ followerId: viewer.id, followingId: author.id });
@@ -1578,7 +1612,415 @@ describe('Article APIs (e2e)', () => {
     });
   });
 
-  it('documents only the six article operations and their DTOs', async () => {
+  describe('Article favorites', () => {
+    let viewerAuthorization: string;
+    let otherAuthorization: string;
+    beforeEach(async () => {
+      const jwt = app.get(JwtService);
+      viewerAuthorization = `Bearer ${await jwt.signAsync({ sub: viewer.id, jti: randomUUID() })}`;
+      otherAuthorization = `Bearer ${await jwt.signAsync({ sub: other.id, jti: randomUUID() })}`;
+    });
+
+    it('allows favoriting own articles, returns the public Single Article and preserves all article data', async () => {
+      const article = await create({ tagList: [tag('one'), tag('two')] });
+      const before = await articles.findOneByOrFail({ slug: article.slug });
+      const links = await dataSource
+        .getRepository(ArticleTag)
+        .findBy({ articleId: before.id });
+      const response = await favorite('post', article.slug).expect(200);
+      expect(response.body).toEqual({
+        article: Object.assign({}, article, {
+          favorited: true,
+          favoritesCount: 1,
+        }),
+      });
+      expect(await articles.findOneByOrFail({ id: before.id })).toEqual(before);
+      const removed = await favorite('delete', article.slug).expect(200);
+      expect(removed.body).toEqual({ article });
+      expect(await articles.findOneByOrFail({ id: before.id })).toEqual(before);
+      expect(
+        await dataSource
+          .getRepository(ArticleTag)
+          .findBy({ articleId: before.id }),
+      ).toEqual(links);
+    });
+
+    it('returns localized article-specific 409 on repeated favorites without logging normal conflicts', async () => {
+      const article = await create();
+      await favorite('post', article.slug, viewerAuthorization)
+        .send({})
+        .expect(200);
+      const log = jest
+        .spyOn(Logger.prototype, 'error')
+        .mockImplementation(() => undefined);
+      expect(
+        (await favorite('post', article.slug, viewerAuthorization).expect(409))
+          .body.message,
+      ).toBe('You have already favorited this article');
+      expect(
+        (
+          await favorite('post', article.slug, viewerAuthorization)
+            .set('x-lang', 'vi')
+            .expect(409)
+        ).body.message,
+      ).toBe('Bạn đã yêu thích bài viết này');
+      expect(log).not.toHaveBeenCalled();
+      const stored = await articles.findOneByOrFail({ slug: article.slug });
+      expect(
+        await dataSource
+          .getRepository(ArticleFavorite)
+          .countBy({ articleId: stored.id }),
+      ).toBe(1);
+    });
+
+    it('resolves simultaneous duplicate favorites through the database key with one 200 and one 409', async () => {
+      const article = await create();
+      const insert = jest.spyOn(EntityManager.prototype, 'insert');
+      const original = insert.getMockImplementation()!;
+      let arrivals = 0;
+      let release!: () => void;
+      const barrier = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      insert.mockImplementation(async function (
+        this: EntityManager,
+        target,
+        values,
+      ) {
+        if (target === ArticleFavorite) {
+          if (++arrivals === 2) release();
+          await barrier;
+        }
+        return original.call(this, target, values);
+      });
+      const responses = await Promise.all([
+        favorite('post', article.slug, viewerAuthorization),
+        favorite('post', article.slug, viewerAuthorization),
+      ]);
+      expect(
+        responses.map((response) => response.status).sort((a, b) => a - b),
+      ).toEqual([200, 409]);
+      expect(arrivals).toBe(2);
+      const stored = await articles.findOneByOrFail({ slug: article.slug });
+      expect(
+        await dataSource
+          .getRepository(ArticleFavorite)
+          .countBy({ articleId: stored.id, userId: viewer.id }),
+      ).toBe(1);
+    });
+
+    it('allows concurrent favorites from different users independently', async () => {
+      const article = await create();
+      await Promise.all([
+        favorite('post', article.slug, viewerAuthorization).expect(200),
+        favorite('post', article.slug, otherAuthorization).expect(200),
+      ]);
+      const response = await get(article.slug, viewerAuthorization).expect(200);
+      expect(response.body.article).toMatchObject({
+        favorited: true,
+        favoritesCount: 2,
+      });
+    });
+
+    it('integrates favorite/unfavorite with Get, List, favorited-user filters and Feed', async () => {
+      const article = await create({ tagList: [tag('integration')] });
+      await dataSource
+        .getRepository(Follow)
+        .insert({ followerId: viewer.id, followingId: author.id });
+      await favorite('post', article.slug, viewerAuthorization).expect(200);
+      await favorite('post', article.slug, otherAuthorization).expect(200);
+      for (const favorited of [true, false]) {
+        if (!favorited)
+          await favorite('delete', article.slug, viewerAuthorization).expect(
+            200,
+          );
+        const favoritesCount = favorited ? 2 : 1;
+        const single = (
+          await get(article.slug, viewerAuthorization).expect(200)
+        ).body.article;
+        expect(single).toEqual(
+          Object.assign({}, article, {
+            favorited,
+            favoritesCount,
+            author: Object.assign({}, article.author, { following: true }),
+          }),
+        );
+        for (const response of [
+          await list({ author: author.username }, viewerAuthorization).expect(
+            200,
+          ),
+          await feed({}, viewerAuthorization).expect(200),
+        ]) {
+          expect(response.body.articlesCount).toBe(1);
+          expect(response.body.articles[0]).toMatchObject({
+            slug: article.slug,
+            favorited,
+            favoritesCount,
+            tagList: article.tagList,
+            author: { following: true },
+          });
+          expect(response.body.articles[0]).not.toHaveProperty('body');
+        }
+        const filtered = await list(
+          { favorited: viewer.username },
+          viewerAuthorization,
+        ).expect(200);
+        expect(filtered.body.articlesCount).toBe(favorited ? 1 : 0);
+        expect(filtered.body.articles).toHaveLength(favorited ? 1 : 0);
+        expect(
+          (await list({ favorited: other.username }).expect(200)).body
+            .articlesCount,
+        ).toBe(1);
+        expect(
+          (await get(article.slug, otherAuthorization).expect(200)).body
+            .article,
+        ).toMatchObject({ favorited: true, favoritesCount });
+        expect(
+          (await get(article.slug).expect(200)).body.article,
+        ).toMatchObject({ favorited: false, favoritesCount });
+      }
+    });
+
+    it('keeps unfavorite idempotent, scoped to both IDs, and safe under repeated concurrent requests', async () => {
+      const article = await create();
+      const retained = await create();
+      await favorite('delete', article.slug, viewerAuthorization).expect(200);
+      await favorite('post', article.slug, viewerAuthorization).expect(200);
+      await favorite('post', article.slug, otherAuthorization).expect(200);
+      await favorite('post', retained.slug, viewerAuthorization).expect(200);
+      const responses = await Promise.all(
+        Array.from({ length: 4 }, () =>
+          favorite('delete', article.slug, viewerAuthorization),
+        ),
+      );
+      for (const response of responses) {
+        expect(response.status).toBe(200);
+        expect(response.body.article).toMatchObject({
+          favorited: false,
+          favoritesCount: 1,
+        });
+      }
+      expect(
+        (
+          await favorite('delete', article.slug, viewerAuthorization).expect(
+            200,
+          )
+        ).body.article.favorited,
+      ).toBe(false);
+      expect(
+        (await get(retained.slug, viewerAuthorization).expect(200)).body
+          .article,
+      ).toMatchObject({ favorited: true, favoritesCount: 1 });
+      expect(
+        (await get(article.slug, otherAuthorization).expect(200)).body.article,
+      ).toMatchObject({ favorited: true, favoritesCount: 1 });
+    });
+
+    it.each(['post', 'delete'] as const)(
+      '%s requires a JWT, returns article 404 and rejects forged input',
+      async (method) => {
+        const article = await create();
+        await favorite(method, article.slug, null).expect(401);
+        const missing = await favorite(
+          method,
+          `missing-${prefix}`,
+          viewerAuthorization,
+        )
+          .set('x-lang', 'vi')
+          .expect(404);
+        expect(missing.body.message).toBe('Không tìm thấy bài viết');
+        for (const body of [
+          { userId: other.id },
+          { articleId: 'forged' },
+          { article: {} },
+          { unknown: true },
+          [],
+          ['value'],
+        ]) {
+          await favorite(method, article.slug, viewerAuthorization)
+            .send(body)
+            .expect(400);
+        }
+        for (const query of [
+          { userId: other.id },
+          { articleId: 'forged' },
+          { unknown: 'x' },
+        ]) {
+          await favorite(method, article.slug, viewerAuthorization)
+            .query(query)
+            .expect(400);
+        }
+        expect(
+          (await get(article.slug).expect(200)).body.article.favoritesCount,
+        ).toBe(0);
+      },
+    );
+
+    it.each(['favorite', 'delete'] as const)(
+      'coordinates concurrent article deletion when %s locks first',
+      async (first) => {
+        const article = await create();
+        const stored = await articles.findOneByOrFail({ slug: article.slug });
+        const find = jest.spyOn(EntityManager.prototype, 'findOne');
+        const original = find.getMockImplementation()!;
+        let signalLocked!: () => void;
+        let signalAttempted!: () => void;
+        let release!: () => void;
+        const locked = new Promise<void>((resolve) => {
+          signalLocked = resolve;
+        });
+        const attempted = new Promise<void>((resolve) => {
+          signalAttempted = resolve;
+        });
+        const barrier = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        const firstMode =
+          first === 'favorite' ? 'pessimistic_read' : 'pessimistic_write';
+        find.mockImplementation(async function (
+          this: EntityManager,
+          target,
+          options,
+        ) {
+          if (
+            target === Article &&
+            options.lock &&
+            options.lock.mode !== firstMode
+          )
+            signalAttempted();
+          const result = await original.call(this, target, options);
+          if (
+            target === Article &&
+            options.lock?.mode === firstMode &&
+            result
+          ) {
+            signalLocked();
+            await barrier;
+          }
+          return result;
+        });
+        const startFavorite = () =>
+          favorite('post', article.slug, viewerAuthorization).then(
+            (response) => response,
+          );
+        const startDelete = () =>
+          mutate('delete', article.slug).then((response) => response);
+        const firstRequest =
+          first === 'favorite' ? startFavorite() : startDelete();
+        await locked;
+        const secondRequest =
+          first === 'favorite' ? startDelete() : startFavorite();
+        await attempted;
+        release();
+        const [firstResult, secondResult] = await Promise.all([
+          firstRequest,
+          secondRequest,
+        ]);
+        expect(firstResult.status).toBe(first === 'favorite' ? 200 : 204);
+        expect(secondResult.status).toBe(first === 'favorite' ? 204 : 404);
+        expect(await articles.existsBy({ id: stored.id })).toBe(false);
+        expect(
+          await dataSource
+            .getRepository(ArticleFavorite)
+            .countBy({ articleId: stored.id }),
+        ).toBe(0);
+      },
+    );
+
+    it.each(['post', 'delete'] as const)(
+      '%s rolls back its write on unexpected database failure and hides SQL details',
+      async (method) => {
+        const article = await create();
+        const stored = await articles.findOneByOrFail({ slug: article.slug });
+        if (method === 'delete')
+          await favorite('post', article.slug, viewerAuthorization).expect(200);
+        const log = jest
+          .spyOn(Logger.prototype, 'error')
+          .mockImplementation(() => undefined);
+        const cause = new QueryFailedError(
+          'private SQL',
+          [],
+          Object.assign(new Error('private driver error'), {
+            code: 'ER_BAD_FIELD_ERROR',
+          }),
+        );
+        if (method === 'post') {
+          const insert = jest.spyOn(EntityManager.prototype, 'insert');
+          const original = insert.getMockImplementation()!;
+          insert.mockImplementation(async function (
+            this: EntityManager,
+            target,
+            values,
+          ) {
+            const result = await original.call(this, target, values);
+            if (target === ArticleFavorite) throw cause;
+            return result;
+          });
+        } else {
+          const deletion = jest.spyOn(EntityManager.prototype, 'delete');
+          const original = deletion.getMockImplementation()!;
+          deletion.mockImplementation(async function (
+            this: EntityManager,
+            target,
+            criteria,
+          ) {
+            const result = await original.call(this, target, criteria);
+            if (target === ArticleFavorite) throw cause;
+            return result;
+          });
+        }
+        const response = await favorite(
+          method,
+          article.slug,
+          viewerAuthorization,
+        ).expect(500);
+        expect(response.body.message).toBe(
+          'Unable to persist or retrieve the article',
+        );
+        expect(JSON.stringify(response.body)).not.toMatch(
+          /private|SQL|auth|stack|query/i,
+        );
+        expect(log).toHaveBeenCalledWith(
+          expect.stringContaining(
+            `articleId=${stored.id}, userId=${viewer.id}`,
+          ),
+          cause.stack,
+        );
+        expect(log).toHaveBeenCalledTimes(1);
+        expect(
+          await dataSource
+            .getRepository(ArticleFavorite)
+            .countBy({ articleId: stored.id, userId: viewer.id }),
+        ).toBe(method === 'post' ? 0 : 1);
+      },
+    );
+
+    it('uses the same bounded two response reads irrespective of tag count', async () => {
+      const article = await create({
+        tagList: Array.from({ length: 20 }, (_, index) => tag(`tag-${index}`)),
+      });
+      const sql = jest.spyOn(dataSource.logger, 'logQuery');
+      for (const method of ['post', 'delete'] as const) {
+        sql.mockClear();
+        expect(
+          (
+            await favorite(method, article.slug, viewerAuthorization).expect(
+              200,
+            )
+          ).body.article.tagList,
+        ).toHaveLength(20);
+        const statements = sql.mock.calls.map(([query]) => query);
+        expect(
+          statements.filter((query) => /^SELECT /i.test(query)),
+        ).toHaveLength(4); // JWT user, locked article, public article+metadata, all tags
+        expect(
+          statements.filter((query) => query.includes('FROM `tags`')),
+        ).toHaveLength(1);
+      }
+    });
+  });
+
+  it('documents only the eight article operations and their DTOs', async () => {
     const response = await request(app.getHttpServer())
       .get('/docs-json')
       .expect(200);
@@ -1586,7 +2028,26 @@ describe('Article APIs (e2e)', () => {
       Object.keys(response.body.paths).filter((path) =>
         path.startsWith('/api/articles'),
       ),
-    ).toEqual(['/api/articles', '/api/articles/feed', '/api/articles/{slug}']);
+    ).toEqual([
+      '/api/articles',
+      '/api/articles/feed',
+      '/api/articles/{slug}',
+      '/api/articles/{slug}/favorite',
+    ]);
+    const favoritePath = response.body.paths['/api/articles/{slug}/favorite'];
+    expect(Object.keys(favoritePath).sort()).toEqual(['delete', 'post']);
+    for (const method of ['post', 'delete']) {
+      const operation = favoritePath[method];
+      expect(operation.security).toEqual([{ bearer: [] }]);
+      expect(
+        operation.responses['200'].content['application/json'].schema.$ref,
+      ).toBe('#/components/schemas/ArticleResponseDto');
+      expect(operation.responses['204']).toBeUndefined();
+      expect(operation.requestBody.required).toBe(false);
+      for (const status of ['400', '401', '404', '503'])
+        expect(operation.responses[status]).toBeDefined();
+    }
+    expect(favoritePath.post.responses['409']).toBeDefined();
     expect(
       response.body.paths['/api/articles'].post.responses['201'],
     ).toBeDefined();

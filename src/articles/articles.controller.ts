@@ -16,6 +16,7 @@ import {
 import {
   ApiBadRequestResponse,
   ApiBearerAuth,
+  ApiBody,
   ApiConflictResponse,
   ApiCreatedResponse,
   ApiForbiddenResponse,
@@ -38,6 +39,7 @@ import { UpdateArticleRequestDto } from './dto/update-article.dto';
 import { ListArticlesQueryDto } from './dto/list-articles-query.dto';
 import { ArticlesResponseDto } from './dto/articles-response.dto';
 import { FeedArticlesQueryDto } from './dto/feed-articles-query.dto';
+import { EmptyFavoriteInputPipe } from './pipes/empty-favorite-input.pipe';
 
 @ApiTags('Articles')
 @ApiUnauthorizedResponse({
@@ -143,6 +145,60 @@ export class ArticlesController {
     @CurrentUser() principal: AuthenticatedPrincipal | undefined,
   ): Promise<ArticleResponseDto> {
     return this.articles.getArticle(slug, principal?.user.id);
+  }
+
+  @Post(':slug/favorite')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Favorite an article',
+    description:
+      'No request fields. First favorite returns 200; repeated favorite returns 409. Own articles may be favorited.',
+  })
+  @ApiBody({
+    required: false,
+    schema: { type: 'object', maxProperties: 0, additionalProperties: false },
+    description: 'No body required; an optional empty object is accepted.',
+  })
+  @ApiOkResponse({ type: ArticleResponseDto })
+  @ApiBadRequestResponse({ description: 'Unexpected request fields' })
+  @ApiNotFoundResponse({ description: 'Article not found' })
+  @ApiConflictResponse({
+    description: 'Article already favorited by this user',
+  })
+  favorite(
+    @Param('slug') slug: string,
+    @CurrentUser() principal: AuthenticatedPrincipal,
+    @Body(EmptyFavoriteInputPipe) _body: unknown,
+    @Query(EmptyFavoriteInputPipe) _query: unknown,
+  ): Promise<ArticleResponseDto> {
+    return this.articles.favoriteArticle(slug, principal.user.id);
+  }
+
+  @Delete(':slug/favorite')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Unfavorite an article',
+    description:
+      'No request fields. Idempotent: returns 200 and the Single Article even when no favorite exists.',
+  })
+  @ApiBody({
+    required: false,
+    schema: { type: 'object', maxProperties: 0, additionalProperties: false },
+    description: 'No body required; an optional empty object is accepted.',
+  })
+  @ApiOkResponse({ type: ArticleResponseDto })
+  @ApiBadRequestResponse({ description: 'Unexpected request fields' })
+  @ApiNotFoundResponse({ description: 'Article not found' })
+  unfavorite(
+    @Param('slug') slug: string,
+    @CurrentUser() principal: AuthenticatedPrincipal,
+    @Body(EmptyFavoriteInputPipe) _body: unknown,
+    @Query(EmptyFavoriteInputPipe) _query: unknown,
+  ): Promise<ArticleResponseDto> {
+    return this.articles.unfavoriteArticle(slug, principal.user.id);
   }
 
   @Put(':slug')

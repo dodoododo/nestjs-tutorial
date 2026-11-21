@@ -1,9 +1,10 @@
-# PR4 article APIs: Commits 2–5
+# PR4 article APIs: Commits 2–6
 
 Commit 2 adds `POST /api/articles` and `GET /api/articles/:slug`. Commit 3 adds
 `PUT /api/articles/:slug` and `DELETE /api/articles/:slug`. Commit 4 adds
 `GET /api/articles` with filtering and pagination. Commit 5 adds the personalized
-`GET /api/articles/feed`. Schema,
+`GET /api/articles/feed`. Commit 6 adds
+`POST /api/articles/:slug/favorite` and `DELETE /api/articles/:slug/favorite`. Schema,
 migrations, `synchronize: false`, and the existing authentication implementation
 remain unchanged. The request and single-article response follow the
 [RealWorld contract](https://realworld-docs.netlify.app/specifications/backend/endpoints/).
@@ -305,6 +306,136 @@ server-side logging without returning SQL or driver details. Swagger documents
 required Bearer authentication, the two query parameters, the shared successful
 response, and validation/authentication/availability errors.
 
+## Favorite and Unfavorite Article (Commit 6)
+
+Both endpoints require the existing Bearer `JwtAuthGuard`. Missing, invalid,
+expired, incorrectly signed or revoked tokens return 401; Redis revocation
+outages remain fail-closed (503). The viewer ID comes exclusively from the
+authenticated principal. Any authenticated user may favorite an existing
+article, including its author. Article ownership is not required.
+
+No body is required. An optional empty JSON object is accepted. The small
+`EmptyFavoriteInputPipe` rejects nonempty body/query objects, arrays and other
+supplied values with 400; neither userId nor articleId can be supplied to choose
+the affected relationship. Use `x-lang` or `Accept-Language` for localization.
+Swagger documents optional empty input, required JWT, the existing Single
+Article success schema and expected error statuses.
+
+The [RealWorld favorite/unfavorite endpoints](https://realworld-docs.netlify.app/specifications/backend/endpoints/#favorite-article)
+return a Single Article, including body. This project's explicit policies are:
+
+- First favorite: **200**, with `favorited: true` and the persisted count.
+- Repeated favorite by the same user: **409**, with
+  `articles.ALREADY_FAVORITED` in English or Vietnamese. This status policy is
+  project-specific, rather than prescribed by RealWorld.
+- Other users may favorite the same article independently.
+- Unfavorite, repeated unfavorite, or unfavorite without an existing favorite:
+  **200**, with the Single Article and `favorited: false` in normal operation.
+- Unknown article slug: **404** for either operation. Unfavorite does not return
+  204 because its response contains the updated Article.
+
+Example requests (no body):
+
+```http
+POST /api/articles/understanding-nestjs/favorite
+Authorization: Bearer <JWT>
+```
+
+Example 200 response:
+
+```json
+{
+  "article": {
+    "slug": "understanding-nestjs",
+    "title": "Understanding NestJS",
+    "description": "A practical introduction",
+    "body": "NestJS is a backend framework...",
+    "tagList": ["nestjs", "typescript"],
+    "createdAt": "2026-11-20T10:00:00.000Z",
+    "updatedAt": "2026-11-20T10:00:00.000Z",
+    "favorited": true,
+    "favoritesCount": 1,
+    "author": {
+      "username": "jacob",
+      "bio": null,
+      "image": null,
+      "following": false
+    }
+  }
+}
+```
+
+```http
+DELETE /api/articles/understanding-nestjs/favorite
+Authorization: Bearer <JWT>
+```
+
+The DELETE's 200 response has the same complete Article shape; for this example
+its `favorited` becomes false and `favoritesCount` becomes 0. Repeating POST
+returns a 409 response whose message is `You have already favorited this article`
+or `Bạn đã yêu thích bài viết này` when Vietnamese is selected.
+
+### Atomic writes, concurrency and errors
+
+The existing `article_favorites` composite primary key `(user_id, article_id)`
+enforces uniqueness. Favorite uses a direct INSERT, with no relationship
+existence precheck. Only `ER_DUP_ENTRY` naming `PRIMARY` or
+`article_favorites.PRIMARY` from that specific INSERT becomes the translated
+409. Unrelated unique keys, foreign-key failures, and errors in response reads
+are not mistaken for duplicate favorites. Expected conflicts are not logged as
+unexpected errors.
+
+Unfavorite uses a direct DELETE scoped by both the resolved article UUID and
+authenticated user UUID. It does not check whether that relationship exists.
+Other users' favorites and this user's favorites on other articles survive.
+Neither operation issues an Article UPDATE or changes content, slug, author,
+timestamps or tags. Counts come from real stored relationships; no denormalized
+counter, cache or migration is introduced.
+
+Each operation performs a short `READ COMMITTED` transaction: resolve only the
+article UUID/slug with a shared `pessimistic_read` lock, insert/delete the
+relationship, and load the existing Single Article before commit. This is a
+multi-statement operation: the transaction protects the article against
+concurrent deletion/renaming and rolls back the write if response loading fails.
+The shared lock coordinates with the existing update/delete exclusive lock
+while allowing concurrent favorites. No ownership check, Redis lock, application
+mutex or broad exclusive article lock is added.
+
+Synchronized duplicate favorites yield one 200 and one 409 and one persisted
+relationship. Concurrent repeated unfavorites remain 200. If deletion obtains
+the article lock first, a waiting favorite returns 404; if favorite obtains its
+lock first, it completes before deletion cascades the relationship. Existing
+article/user foreign keys retain their cascade behavior.
+
+The existing bounded mutation retry loop retries only genuine
+`ER_LOCK_DEADLOCK`, at most three total attempts, each with a fresh transaction.
+Unexpected query failures log their original stack with the operation and safe
+article/user IDs, preserve the original exception as a server-side cause, and
+return the article-specific translated persistence error without SQL/driver
+details. Non-query exceptions propagate unchanged. Authentication errors keep
+their existing handling; article failures never use auth service messages.
+
+### Shared responses and read consistency
+
+Responses reuse `loadArticle`, `ArticleResponseDto` and the pure `mapArticle`.
+The loader uses one public article/author query with favorite/follow subqueries
+and one query for all tags. There is no SQL inside mapping or per-tag loop.
+Each endpoint uses four SELECTs (JWT user lookup, locked article lookup, public
+article with metadata, batch tags), one relationship write and transaction
+control statements. The number stays fixed with 20 tags. Existing List/Feed
+batch metadata and their query counts are unchanged.
+
+Get, List, favorited-username filtering and Feed all observe the persisted
+relationships through their existing metadata queries. Viewer favorite states
+remain independent and author.following still comes from Follow.
+
+The response describes metadata visible to its read within the transaction;
+concurrent changes by other users may commit afterward, so a count is not a
+promise about the state when the client receives it. A concurrent opposite
+operation on a previously absent relationship can also change viewer state
+before metadata is read. No snapshot guarantee across follow/tag reads is added.
+List/Feed retain their previously documented separate-read limitations.
+
 ## Verification
 
 Unit tests cover validation, Unicode/byte boundaries, slug normalization and
@@ -343,6 +474,15 @@ articles, reverse follows, self exclusion, subsequent unfollows, viewer isolatio
 deterministic paging, actual favorites and full tag lists, strict validation,
 JWT/Redis failures, static-route precedence and the shared Swagger schema. All
 previous List filters and single-article operations remain regression-tested.
+
+Commit 6 adds input validation, scoped writes, narrow constraint classification,
+article-domain translations, deadlock retry bounds, original error causes and
+safe logging tests. E2E tests synchronize duplicate inserts and both article
+deletion lock orderings, exercise repeated concurrent unfavorites, independent
+users and own favorites, validate Get/List/Feed integration, preserve content
+and timestamps, check rollback after injected persistence failures, and count
+response reads with 20 tags. JWT/Redis and Swagger coverage includes both new
+operations, and existing List/Feed query-count tests remain unchanged.
 
 E2E fixtures refuse writes outside `127.0.0.1:3308/nestjs_tutorial_test` and require
 the test Redis instance at `127.0.0.1:6380`. Cleanup removes only fixture users,

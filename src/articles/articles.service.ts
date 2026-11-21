@@ -51,6 +51,24 @@ function isSlugConflict(error: unknown): boolean {
   );
 }
 
+// Called only around INSERT into ArticleFavorite. Match the actual primary-key
+// violation, not every duplicate-entry error (or an unrelated table's PRIMARY).
+function isFavoriteConflict(error: unknown): boolean {
+  return (
+    mysqlCode(error) === 'ER_DUP_ENTRY' &&
+    error instanceof QueryFailedError &&
+    /for key ['`](?:article_favorites\.)?PRIMARY['`]$/i.test(
+      (error.driverError as { message?: string }).message ?? '',
+    )
+  );
+}
+
+interface FavoriteMutationContext {
+  operation: 'favorite' | 'unfavorite';
+  userId: string;
+  articleId?: string;
+}
+
 @Injectable()
 export class ArticlesService {
   private readonly logger = new Logger(ArticlesService.name);
@@ -356,6 +374,57 @@ export class ArticlesService {
     });
   }
 
+  favoriteArticle(slug: string, userId: string): Promise<ArticleResponseDto> {
+    return this.changeFavorite(slug, userId, 'favorite');
+  }
+
+  unfavoriteArticle(slug: string, userId: string): Promise<ArticleResponseDto> {
+    return this.changeFavorite(slug, userId, 'unfavorite');
+  }
+
+  private changeFavorite(
+    slug: string,
+    userId: string,
+    operation: FavoriteMutationContext['operation'],
+  ): Promise<ArticleResponseDto> {
+    const context: FavoriteMutationContext = { operation, userId };
+    return this.runMutation(async (manager) => {
+      // A shared article lock protects the target/slug through write + response
+      // and coordinates with existing update/delete exclusive locks. It permits
+      // concurrent favorites without an application mutex or article UPDATE.
+      const article = await manager.findOne(Article, {
+        where: { slug },
+        select: { id: true, slug: true },
+        lock: { mode: 'pessimistic_read' },
+      });
+      if (!article)
+        throw new NotFoundException(this.i18n.t('articles.NOT_FOUND'));
+      context.articleId = article.id;
+      if (operation === 'favorite') {
+        try {
+          await manager.insert(ArticleFavorite, {
+            userId,
+            articleId: article.id,
+          });
+        } catch (error: unknown) {
+          if (isFavoriteConflict(error)) {
+            throw new ConflictException(
+              this.i18n.t('articles.ALREADY_FAVORITED'),
+            );
+          }
+          throw error;
+        }
+      } else {
+        // No precheck: deleting no row is an intentional successful no-op.
+        await manager.delete(ArticleFavorite, {
+          userId,
+          articleId: article.id,
+        });
+      }
+      return this.loadArticle(manager, article.slug, userId);
+    }, context);
+  }
+
   private async findOwnedArticle(
     manager: EntityManager,
     slug: string,
@@ -378,6 +447,7 @@ export class ArticlesService {
 
   private async runMutation<T>(
     operation: (manager: EntityManager) => Promise<T>,
+    context?: FavoriteMutationContext,
   ): Promise<T> {
     for (let attempt = 1; ; attempt++) {
       try {
@@ -388,10 +458,10 @@ export class ArticlesService {
           attempt < ARTICLE_TRANSACTION_MAX_ATTEMPTS
         )
           continue;
-        if (isSlugConflict(error)) {
+        if (context === undefined && isSlugConflict(error)) {
           throw new ConflictException(this.i18n.t('articles.SLUG_CONFLICT'));
         }
-        this.handlePersistenceError(error);
+        this.handlePersistenceError(error, context);
       }
     }
   }
@@ -472,10 +542,18 @@ export class ArticlesService {
     };
   }
 
-  private handlePersistenceError(error: unknown): never {
+  private handlePersistenceError(
+    error: unknown,
+    context?: FavoriteMutationContext,
+  ): never {
     if (error instanceof QueryFailedError) {
       // Full cause stays server-side; SQL and driver details never reach clients.
-      this.logger.error('Article persistence failed', error.stack);
+      this.logger.error(
+        context === undefined
+          ? 'Article persistence failed'
+          : `Article persistence failed (${context.operation}, articleId=${context.articleId ?? 'unresolved'}, userId=${context.userId})`,
+        error.stack,
+      );
       throw new InternalServerErrorException(
         this.i18n.t('articles.PERSISTENCE_FAILED'),
         { cause: error },
