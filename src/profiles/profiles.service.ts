@@ -12,6 +12,7 @@ import { MYSQL_DUPLICATE_ENTRY_CODE } from '../auth/constants/auth.constant';
 import { Follow } from '../database/entities/follow.entity';
 import { User } from '../database/entities/user.entity';
 import { ProfileResponseDto } from './dto/profile-response.dto';
+import { mapProfile } from './mappers/profile-response.mapper';
 
 type ProfileUser = Pick<User, 'id' | 'username' | 'bio' | 'image'>;
 
@@ -104,12 +105,7 @@ export class ProfilesService {
     following: boolean,
   ): ProfileResponseDto {
     return {
-      profile: {
-        username: user.username,
-        bio: user.bio,
-        image: user.image,
-        following,
-      },
+      profile: mapProfile(user, following),
     };
   }
 }

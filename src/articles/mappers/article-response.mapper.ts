@@ -1,12 +1,15 @@
 import type { Article } from '../../database/entities/article.entity';
-import type { User } from '../../database/entities/user.entity';
+import {
+  mapProfile,
+  type PublicProfileUser,
+} from '../../profiles/mappers/profile-response.mapper';
 import type { ArticleDto } from '../dto/article-response.dto';
 import type { ArticleSummaryDto } from '../dto/articles-response.dto';
 
 export type LoadedArticle = Pick<
   Article,
   'slug' | 'title' | 'description' | 'body' | 'createdAt' | 'updatedAt'
-> & { author: Pick<User, 'username' | 'bio' | 'image'> };
+> & { author: PublicProfileUser };
 
 export interface ArticleMetadata {
   tagList: string[];
@@ -38,11 +41,6 @@ export function mapArticleSummary(
     updatedAt: article.updatedAt.toISOString(),
     favorited: metadata.favorited,
     favoritesCount: metadata.favoritesCount,
-    author: {
-      username: article.author.username,
-      bio: article.author.bio,
-      image: article.author.image,
-      following: metadata.following,
-    },
+    author: mapProfile(article.author, metadata.following),
   };
 }
