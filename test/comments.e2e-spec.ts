@@ -16,14 +16,13 @@ import {
 } from 'typeorm';
 import { AppModule } from '../src/app.module';
 import { INVALID_USER_PASSWORD_HASH } from '../src/auth/constants/auth.constant';
+import { JwtStrategy } from '../src/auth/strategies/jwt.strategy';
 import { CommentResponseDto } from '../src/comments/dto/comment-response.dto';
 import { CommentsResponseDto } from '../src/comments/dto/comments-response.dto';
 import { COMMENT_BODY_MAX_BYTES } from '../src/comments/constants/comment.constant';
 import { CommentsService } from '../src/comments/comments.service';
-import {
-  COMMENT_JSON_MAX_BYTES,
-  setupCommentBodyParser,
-} from '../src/comments/comment-body-parser';
+import { COMMENT_JSON_MAX_BYTES } from '../src/comments/comment-body-parser';
+import { configureHttpApplication } from '../src/configure-http-application';
 import { Article } from '../src/database/entities/article.entity';
 import { Comment } from '../src/database/entities/comment.entity';
 import { User } from '../src/database/entities/user.entity';
@@ -117,8 +116,7 @@ describe('Comment APIs (e2e)', () => {
       imports: [AppModule],
     }).compile();
     app = moduleRef.createNestApplication();
-    app.setGlobalPrefix('api');
-    setupCommentBodyParser(app);
+    configureHttpApplication(app);
     setupSwagger(app);
     await app.init();
     dataSource = app.get(DataSource);
@@ -211,6 +209,32 @@ describe('Comment APIs (e2e)', () => {
     expect(result.createdAt).toBe(saved.createdAt.toISOString());
     expect(result.updatedAt).toBe(saved.updatedAt.toISOString());
     expect(await articles.findOneByOrFail({ id: article.id })).toEqual(article);
+  });
+
+  it('uses only the JWT User lookup and one Article lookup during creation', async () => {
+    const sql = jest.spyOn(dataSource.logger, 'logQuery');
+    await post().expect(201);
+    const statements = sql.mock.calls.map(([statement]) => statement);
+    expect(
+      statements.filter((statement) => statement.includes('FROM `users`')),
+    ).toHaveLength(1);
+    expect(
+      statements.filter(
+        (statement) =>
+          statement.startsWith('SELECT ') &&
+          statement.includes('FROM `articles`'),
+      ),
+    ).toHaveLength(1);
+    expect(
+      statements.filter((statement) =>
+        statement.startsWith('INSERT INTO `comments`'),
+      ),
+    ).toHaveLength(1);
+    expect(statements).not.toEqual(
+      expect.arrayContaining([
+        expect.stringMatching(/START TRANSACTION|COMMIT/),
+      ]),
+    );
   });
 
   it('allows own-article comments and repeated comments without changing other articles or comments', async () => {
@@ -353,6 +377,123 @@ describe('Comment APIs (e2e)', () => {
   });
 
   it.each([
+    'application/json',
+    'application/json; charset=utf-8',
+    'Application/JSON; Charset=UTF-8',
+  ])(
+    'accepts maximum escaped JSON with Content-Type %s',
+    async (contentType) => {
+      const body = '\u0000'.repeat(COMMENT_BODY_MAX_BYTES);
+      await request(app.getHttpServer())
+        .post(
+          `/api/articles/${encodeURIComponent(article.slug)}/comments/?lang=en`,
+        )
+        .set('Authorization', `Bearer ${token}`)
+        .set('Content-Type', contentType)
+        .send(JSON.stringify({ comment: { body } }))
+        .expect(201);
+      expect(await ownCount()).toBe(1);
+    },
+  );
+
+  it.each([
+    'text/plain',
+    'application/vnd.api+json',
+    'application/octet-stream',
+  ])(
+    'does not parse unsupported Content-Type %s as JSON',
+    async (contentType) => {
+      await request(app.getHttpServer())
+        .post(`/api/articles/${encodeURIComponent(article.slug)}/comments`)
+        .set('Authorization', `Bearer ${token}`)
+        .set('Content-Type', contentType)
+        .send(JSON.stringify({ comment: { body: 'Text' } }))
+        .expect(400);
+      expect(await ownCount()).toBe(0);
+    },
+  );
+
+  it.each(['comments', 'articles'])(
+    'returns 400 for malformed JSON on %s',
+    async (route) => {
+      const path =
+        route === 'comments'
+          ? `/api/articles/${encodeURIComponent(article.slug)}/comments`
+          : '/api/articles';
+      await request(app.getHttpServer())
+        .post(path)
+        .set('Authorization', `Bearer ${token}`)
+        .set('Content-Type', 'application/json')
+        .send('{"comment":')
+        .expect(400);
+      expect(await ownCount()).toBe(0);
+    },
+  );
+
+  it.each(['v2/api', ''])(
+    'preserves scoped transport limits with global prefix %j',
+    async (prefix) => {
+      // Passport's strategy registry is process-global. Reuse the real strategy
+      // so closing this second app cannot replace the first app's live client.
+      const moduleRef = await Test.createTestingModule({
+        imports: [AppModule],
+      })
+        .overrideProvider(JwtStrategy)
+        .useValue(app.get(JwtStrategy))
+        .compile();
+      const alternate =
+        moduleRef.createNestApplication<NestExpressApplication>();
+      try {
+        // This is the same prefix/parser configuration called by main.ts.
+        configureHttpApplication(alternate, prefix);
+        await alternate.init();
+        expect(alternate.get(DataSource).options).toMatchObject({
+          type: 'mysql',
+          host: '127.0.0.1',
+          port: 3308,
+          database: 'nestjs_tutorial_test',
+          synchronize: false,
+          migrationsRun: false,
+        });
+        const root = prefix ? `/${prefix}` : '';
+        const path = `${root}/articles/${encodeURIComponent(article.slug)}/comments`;
+        for (const body of [
+          '\u0000'.repeat(COMMENT_BODY_MAX_BYTES),
+          '\u20ac'.repeat(21_845),
+        ]) {
+          const response = await request(alternate.getHttpServer())
+            .post(path)
+            .set('Authorization', `Bearer ${token}`)
+            .send({ comment: { body } })
+            .expect(201);
+          const result = (response.body as CommentResponseDto).comment;
+          expect(result.body).toBe(body);
+          expect((await comments.findOneByOrFail({ id: result.id })).body).toBe(
+            body,
+          );
+        }
+        await request(alternate.getHttpServer())
+          .post(path)
+          .set('Authorization', `Bearer ${token}`)
+          .send({ comment: { body: 'x'.repeat(COMMENT_JSON_MAX_BYTES) } })
+          .expect(413);
+        await request(alternate.getHttpServer())
+          .post(path)
+          .set('Authorization', `Bearer ${token}`)
+          .send({ comment: { body: 'x'.repeat(COMMENT_BODY_MAX_BYTES + 1) } })
+          .expect(400);
+        await request(alternate.getHttpServer())
+          .post(`${root}/articles`)
+          .send({ comment: { body: '\u0000'.repeat(COMMENT_BODY_MAX_BYTES) } })
+          .expect(413);
+        expect(await ownCount()).toBe(2);
+      } finally {
+        await alternate.close();
+      }
+    },
+  );
+
+  it.each([
     null,
     '',
     'Bearer',
@@ -418,23 +559,72 @@ describe('Comment APIs (e2e)', () => {
     );
   });
 
-  it('handles a real concurrent Article deletion with 404 and no orphan', async () => {
-    const find = jest.spyOn(dataSource.manager, 'findOne');
-    const original = find.getMockImplementation()!;
-    find.mockImplementation(async function (
-      this: EntityManager,
-      target,
-      options,
-    ) {
-      const result = await original.call(this, target, options);
-      if (target === Article) await articles.delete(article.id);
-      return result;
-    });
-    await post().expect(404);
-    expect(await ownCount()).toBe(0);
-    expect(await articles.existsBy({ id: article.id })).toBe(false);
-    expect(await articles.existsBy({ id: unrelated.id })).toBe(true);
-  });
+  it.each(['en', 'vi'])(
+    'handles a real concurrent Article deletion with localized 404 and no extra lookup (%s)',
+    async (lang) => {
+      const find = jest.spyOn(dataSource.manager, 'findOne');
+      const original = find.getMockImplementation()!;
+      find.mockImplementation(async function (
+        this: EntityManager,
+        target,
+        options,
+      ) {
+        const result = await original.call(this, target, options);
+        if (target === Article) await articles.delete(article.id);
+        return result;
+      });
+      const sql = jest.spyOn(dataSource.logger, 'logQuery');
+      const response = await post().query({ lang }).expect(404);
+      expect(response.body.message).toBe(
+        lang === 'vi'
+          ? 'Không tìm thấy bài viết cho bình luận này'
+          : 'Article not found for this comment',
+      );
+      const statements = sql.mock.calls.map(([statement]) => statement);
+      expect(
+        statements.filter(
+          (statement) =>
+            statement.startsWith('SELECT ') &&
+            statement.includes('FROM `articles`'),
+        ),
+      ).toHaveLength(1);
+      expect(await ownCount()).toBe(0);
+      expect(await articles.existsBy({ id: article.id })).toBe(false);
+      expect(await articles.existsBy({ id: unrelated.id })).toBe(true);
+    },
+  );
+
+  it.each(['FK_comments_author_id', 'FK_comments_article_id_extra'])(
+    'sanitizes unrelated FK %s as 500 without an Article recheck',
+    async (constraint) => {
+      const cause = new QueryFailedError(
+        'private SQL',
+        ['private body'],
+        Object.assign(new Error(`CONSTRAINT \`${constraint}\` FOREIGN KEY`), {
+          code: 'ER_NO_REFERENCED_ROW_2',
+        }),
+      );
+      jest.spyOn(dataSource.manager, 'save').mockRejectedValueOnce(cause);
+      const exists = jest.spyOn(dataSource.manager, 'existsBy');
+      const log = jest
+        .spyOn(Logger.prototype, 'error')
+        .mockImplementation(() => undefined);
+      const response = await post().expect(500);
+      expect(response.body.message).toBe('Unable to create the comment');
+      expect(JSON.stringify(response.body)).not.toMatch(
+        /private|SQL|constraint|stack/i,
+      );
+      expect(exists).not.toHaveBeenCalled();
+      expect(log).toHaveBeenCalledWith('Comment creation failed', {
+        errorType: 'QueryFailedError',
+        code: 'ER_NO_REFERENCED_ROW_2',
+      });
+      expect(await ownCount()).toBe(0);
+      expect(await articles.findOneByOrFail({ id: article.id })).toEqual(
+        article,
+      );
+    },
+  );
 
   it.each(['en', 'vi'])(
     'sanitizes unexpected database errors and translates persistence failures (%s)',
@@ -1108,28 +1298,128 @@ describe('Comment APIs (e2e)', () => {
       expect(await comments.findOneByOrFail({ id: target.id })).toEqual(target);
     });
 
-    it('handles concurrent duplicate deletion as one 204 and one 404 without changing unrelated Comments', async () => {
+    it('forces both DELETE lookups before one scoped deletion affects zero rows', async () => {
       const target = await createTarget();
       const retained = await comments.save({
         articleId: article.id,
         authorId: owner.id,
         body: 'Retained',
       });
-      const responses = await Promise.all([
-        remove(target.id),
-        remove(target.id),
-      ]);
-      expect(
-        responses
-          .map((response) => response.status)
-          .sort((left, right) => left - right),
-      ).toEqual([204, 404]);
-      expect(await comments.existsBy({ id: target.id })).toBe(false);
-      expect(await comments.findOneByOrFail({ id: retained.id })).toEqual(
-        retained,
+      const otherComment = await comments.save({
+        articleId: unrelated.id,
+        authorId: commenter.id,
+        body: 'Unrelated Article comment',
+      });
+      function deferred() {
+        let resolve!: () => void;
+        const promise = new Promise<void>((release) => {
+          resolve = release;
+        });
+        return { promise, resolve };
+      }
+      const bothRead = deferred();
+      const firstDeleted = deferred();
+      const gates = [deferred(), deferred()];
+      const observed: string[] = [];
+      const affected: (number | null | undefined)[] = [];
+      const scopes: unknown[] = [];
+      async function bounded<T>(
+        promise: Promise<T>,
+        label: string,
+      ): Promise<T> {
+        let timeout!: ReturnType<typeof setTimeout>;
+        try {
+          return await Promise.race([
+            promise,
+            new Promise<never>((_, reject) => {
+              timeout = setTimeout(
+                () => reject(new Error(`Timed out waiting for ${label}`)),
+                5_000,
+              );
+            }),
+          ]);
+        } finally {
+          clearTimeout(timeout);
+        }
+      }
+      const find = jest.spyOn(dataSource.manager, 'findOne');
+      const originalFind = find.getMockImplementation()!;
+      find.mockImplementation(async function (
+        this: EntityManager,
+        entity,
+        options,
+      ) {
+        const result = await originalFind.call(this, entity, options);
+        if (entity === Comment && result?.id === target.id) {
+          const index = observed.length;
+          observed.push(result.id);
+          if (observed.length === 2) bothRead.resolve();
+          await bounded(gates[index]!.promise, 'lookup release');
+        }
+        return result;
+      });
+      const deletion = jest.spyOn(dataSource.manager, 'delete');
+      const originalDelete = deletion.getMockImplementation()!;
+      deletion.mockImplementation(async function (
+        this: EntityManager,
+        entity,
+        criteria,
+      ) {
+        const result = await originalDelete.call(this, entity, criteria);
+        if (entity === Comment) {
+          scopes.push(criteria);
+          affected.push(result.affected);
+          if (affected.length === 1) firstDeleted.resolve();
+        }
+        return result;
+      });
+      const pending = [remove(target.id), remove(target.id)].map((req) =>
+        req
+          .timeout({ response: 8_000, deadline: 10_000 })
+          .then((response) => response),
       );
-      expect(await articles.existsBy({ id: article.id })).toBe(true);
-    });
+      try {
+        await bounded(bothRead.promise, 'both Comment lookups');
+        expect(observed).toEqual([target.id, target.id]);
+        expect(affected).toEqual([]);
+        gates[0]!.resolve();
+        await bounded(firstDeleted.promise, 'first DELETE completion');
+        expect(affected).toEqual([1]);
+        gates[1]!.resolve();
+        const responses = await Promise.all(pending);
+        expect(affected).toEqual([1, 0]);
+        expect(scopes).toEqual(
+          Array(2).fill({
+            id: target.id,
+            articleId: article.id,
+            authorId: commenter.id,
+          }),
+        );
+        expect(
+          responses
+            .map((response) => response.status)
+            .sort((left, right) => left - right),
+        ).toEqual([204, 404]);
+        expect(await comments.existsBy({ id: target.id })).toBe(false);
+        expect(await comments.findOneByOrFail({ id: retained.id })).toEqual(
+          retained,
+        );
+        expect(await comments.findOneByOrFail({ id: otherComment.id })).toEqual(
+          otherComment,
+        );
+        expect(await articles.findOneByOrFail({ id: article.id })).toEqual(
+          article,
+        );
+        expect(await articles.findOneByOrFail({ id: unrelated.id })).toEqual(
+          unrelated,
+        );
+      } finally {
+        for (const gate of gates) gate.resolve();
+        await Promise.allSettled(pending);
+        find.mockRestore();
+        deletion.mockRestore();
+      }
+    }, 15_000);
 
     it.each(['en', 'vi'])(
       'logs and sanitizes unexpected DELETE errors (%s)',
@@ -1213,7 +1503,12 @@ describe('Comment APIs (e2e)', () => {
       '500',
       '503',
     ]);
-    expect(deletion.responses['204'].content).toBeUndefined();
+    const response204 = deletion.responses['204'];
+    expect(response204).toBeDefined();
+    if (!response204 || '$ref' in response204) {
+      throw new Error('Expected an inline HTTP 204 response definition');
+    }
+    expect(response204.content).toBeUndefined();
     expect(deletion.parameters).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ name: 'slug', in: 'path', required: true }),

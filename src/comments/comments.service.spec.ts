@@ -7,7 +7,6 @@ import { I18nService } from 'nestjs-i18n';
 import { DataSource, In, QueryFailedError } from 'typeorm';
 import { Article } from '../database/entities/article.entity';
 import { Comment } from '../database/entities/comment.entity';
-import { User } from '../database/entities/user.entity';
 import { Follow } from '../database/entities/follow.entity';
 import { CommentsService } from './comments.service';
 
@@ -25,6 +24,9 @@ describe('CommentsService', () => {
     image: null,
     email: 'private@example.test',
     passwordHash: 'private-hash',
+    tokenVersion: 0,
+    createdAt: new Date('2026-01-01T00:00:00Z'),
+    updatedAt: new Date('2026-01-01T00:00:00Z'),
   };
   const saved = {
     id: '00000000-0000-4000-8000-000000000003',
@@ -463,16 +465,9 @@ describe('CommentsService', () => {
       articleId: 'forged',
       id: 'forged',
     };
-    const result = await service.createComment(article.slug, dto, authorId);
+    const result = await service.createComment(article.slug, dto, profile);
     expect(manager.findOne.mock.calls).toEqual([
       [Article, { where: { slug: article.slug }, select: { id: true } }],
-      [
-        User,
-        {
-          where: { id: authorId },
-          select: { username: true, bio: true, image: true },
-        },
-      ],
     ]);
     expect(manager.save).toHaveBeenCalledTimes(1);
     expect(manager.save).toHaveBeenCalledWith(
@@ -482,6 +477,7 @@ describe('CommentsService', () => {
     );
     expect(manager.update).not.toHaveBeenCalled();
     expect(manager.transaction).not.toHaveBeenCalled();
+    expect(manager.existsBy).not.toHaveBeenCalled();
     expect(result).toEqual({
       comment: {
         id: saved.id,
@@ -502,7 +498,7 @@ describe('CommentsService', () => {
   it('explicitly returns 404 for a nonexistent article without creating a comment', async () => {
     manager.findOne.mockResolvedValueOnce(null);
     await expect(
-      service.createComment('unknown', { body: 'Body' }, authorId),
+      service.createComment('unknown', { body: 'Body' }, profile),
     ).rejects.toMatchObject({
       status: 404,
       message: 'comments.ARTICLE_NOT_FOUND',
@@ -512,22 +508,12 @@ describe('CommentsService', () => {
     expect(log).not.toHaveBeenCalled();
   });
 
-  it('returns 401 if the authenticated author disappears before loading their profile', async () => {
-    manager.findOne.mockResolvedValueOnce(article).mockResolvedValueOnce(null);
-    await expect(
-      service.createComment(article.slug, { body: 'Body' }, authorId),
-    ).rejects.toMatchObject({ status: 401 });
-    expect(manager.save).not.toHaveBeenCalled();
-  });
-
   it('allows the article owner to comment with populated profile values', async () => {
-    manager.findOne
-      .mockResolvedValueOnce({ ...article, authorId })
-      .mockResolvedValueOnce({ ...profile, bio: 'Bio', image: '/avatar.png' });
+    manager.findOne.mockResolvedValueOnce({ ...article, authorId });
     const result = await service.createComment(
       article.slug,
       { body: saved.body },
-      authorId,
+      { ...profile, bio: 'Bio', image: '/avatar.png' },
     );
     expect(result.comment.author).toEqual({
       username: 'commenter',
@@ -539,43 +525,40 @@ describe('CommentsService', () => {
 
   it('returns 404 for a confirmed concurrent article deletion after its specific FK failure', async () => {
     manager.save.mockRejectedValueOnce(failure('ER_NO_REFERENCED_ROW_2'));
-    manager.existsBy.mockResolvedValueOnce(false);
+    manager.existsBy.mockRejectedValueOnce(new Error('Redundant query'));
     await expect(
-      service.createComment(article.slug, { body: 'Body' }, authorId),
+      service.createComment(article.slug, { body: 'Body' }, profile),
     ).rejects.toBeInstanceOf(NotFoundException);
-    expect(manager.existsBy).toHaveBeenCalledWith(Article, { id: article.id });
+    expect(manager.existsBy).not.toHaveBeenCalled();
     expect(log).not.toHaveBeenCalled();
   });
 
   it.each([
+    ['author FK', 'ER_NO_REFERENCED_ROW_2', 'FK_comments_author_id'],
+    ['unrecognized FK', 'ER_NO_REFERENCED_ROW_2', 'another_constraint'],
     [
-      'article FK with parent still present',
+      'lookalike FK suffix',
       'ER_NO_REFERENCED_ROW_2',
-      'FK_comments_article_id',
-      true,
+      'FK_comments_article_id_extra',
     ],
     [
-      'author FK even when article is missing',
+      'lookalike FK prefix',
       'ER_NO_REFERENCED_ROW_2',
-      'FK_comments_author_id',
-      false,
+      'other_FK_comments_article_id',
     ],
-    ['unrecognized FK', 'ER_NO_REFERENCED_ROW_2', 'another_constraint', false],
     [
       'unrelated database failure',
       'ER_BAD_FIELD_ERROR',
       'FK_comments_article_id',
-      false,
     ],
   ])(
     'sanitizes %s without converting it to Article Not Found',
-    async (_label, code, constraint, exists) => {
+    async (_label, code, constraint) => {
       const cause = failure(code as string, constraint as string);
       manager.save.mockRejectedValueOnce(cause);
-      manager.existsBy.mockResolvedValueOnce(exists);
       let caught: unknown;
       try {
-        await service.createComment(article.slug, { body: 'Body' }, authorId);
+        await service.createComment(article.slug, { body: 'Body' }, profile);
       } catch (error) {
         caught = error;
       }
@@ -594,32 +577,19 @@ describe('CommentsService', () => {
         errorType: 'QueryFailedError',
         code,
       });
-      expect(manager.existsBy).toHaveBeenCalledTimes(
-        constraint === 'FK_comments_article_id' &&
-          code === 'ER_NO_REFERENCED_ROW_2'
-          ? 1
-          : 0,
-      );
+      expect(manager.existsBy).not.toHaveBeenCalled();
     },
   );
 
-  it.each(['article lookup', 'profile lookup', 'save', 'race confirmation'])(
+  it.each(['article lookup', 'save'])(
     'logs and sanitizes unexpected failures during %s with their original cause',
     async (step) => {
       const cause = new Error('private request body or secret');
       if (step === 'article lookup')
         manager.findOne.mockRejectedValueOnce(cause);
-      if (step === 'profile lookup')
-        manager.findOne
-          .mockResolvedValueOnce(article)
-          .mockRejectedValueOnce(cause);
       if (step === 'save') manager.save.mockRejectedValueOnce(cause);
-      if (step === 'race confirmation') {
-        manager.save.mockRejectedValueOnce(failure('ER_NO_REFERENCED_ROW_2'));
-        manager.existsBy.mockRejectedValueOnce(cause);
-      }
       await expect(
-        service.createComment(article.slug, { body: 'Body' }, authorId),
+        service.createComment(article.slug, { body: 'Body' }, profile),
       ).rejects.toMatchObject({
         status: 500,
         message: 'comments.PERSISTENCE_FAILED',

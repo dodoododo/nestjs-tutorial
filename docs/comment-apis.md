@@ -48,13 +48,27 @@ Article; those DTOs remain unchanged.
 
 The final review corrected a transport boundary: JSON escaping can make valid
 65,535-byte text exceed Express's default 100 KB JSON limit. Before application
-initialization, `setupCommentBodyParser` registers a 400 KiB JSON parser only for
-POST Comments, followed by the default parser for other JSON requests. This
+initialization, `configureHttpApplication` sets the global prefix and calls
+`setupCommentBodyParser` with that same prefix. The parser uses native Express
+POST route matching and `COMMENT_COLLECTION_PATH`, the same constant used by
+`CommentsController`; no prefix or controller route regex is duplicated.
+It registers a 400 KiB JSON parser only for POST Comments, followed by the default
+parser for other JSON requests. This
 allows even six-byte JSON escapes at the TEXT boundary; the DTO still enforces
 65,535 decoded UTF-8 bytes. Requests exceeding the transport cap return 413.
 Other routes and methods retain their existing transport limits. HTTP tests
-verify escaped line breaks, quotes, control characters, decoded-byte rejection
-and the unchanged limits outside POST Comments.
+verify escaped line breaks, quotes, control characters, decoded-byte rejection,
+malformed JSON, Content-Type variations and the unchanged limits outside POST
+Comments. The same production bootstrap helper is exercised with `api`, `v2/api`
+and no global prefix, including maximum-size escaped and multibyte bodies.
+
+A global 400 KiB limit would increase parsing work and memory use for every
+JSON endpoint, including unauthenticated requests. The route-scoped parser keeps
+that increase confined to Comment creation. A Nest module middleware would run
+after the default parser and require disabling and replacing the defaults; the
+bootstrap registration preserves Nest's automatic URL-encoded parser instead.
+See the [Nest middleware guidance](https://docs.nestjs.com/middleware) and
+[Express body-parser options/errors](https://expressjs.com/en/resources/middleware/body-parser/).
 
 ## Persistence and response
 
@@ -63,8 +77,10 @@ Unknown slugs return a Comment-domain 404 before any write. Any authenticated us
 can comment, including the Article's owner. Article authorship is independent of
 Comment authorship, which comes only from `principal.user.id`.
 
-The service fetches the author's public profile fields before writing, then saves
-an explicit allowlist of `articleId`, `authorId` and `body`. TypeORM generates the
+The controller passes the complete `principal.user` already loaded and validated
+by `JwtStrategy`. The service uses that user's ID and public profile fields
+without another User query, then saves an explicit allowlist of `articleId`,
+`authorId` and `body`. TypeORM generates the
 UUID, performs one atomic INSERT and reloads the database-generated millisecond
 timestamps. `transaction: false` avoids a transaction around this single write.
 The Article content, timestamps and relationship storage are untouched. Multiple
@@ -212,6 +228,13 @@ DELETE of an immutable-author Comment. Only the intended Comment is removed;
 Article content/timestamps/tags/favorites, Users, Follows and other Comments stay
 intact. Existing schema, foreign keys and migrations are unchanged.
 
+The concurrent DELETE HTTP test gates both successful Comment lookups before
+either deletion can proceed. It releases one request, observes its scoped DELETE
+affect one row, then releases the second and observes zero affected rows. The
+responses must be exactly 204 and 404, with unrelated Comments and Articles
+unchanged. Synchronization waits and HTTP requests have deadlines; `finally`
+releases every gate, drains requests and restores the persistence spies.
+
 Expected 403/404 errors are preserved without unexpected-error logging.
 Unexpected lookup/DELETE errors use the existing safe Logger metadata and
 server-side original cause, with a sanitized Comments-domain 500 response.
@@ -225,14 +248,15 @@ GET Comments retains `Cache-Control: private, no-store` and its existing batchin
 - Missing, invalid, expired, incorrectly signed, revoked or deleted-user JWTs
   return 401 through the existing authentication implementation.
 - Redis revocation-check unavailability remains fail-closed with 503.
-- A missing author during the service's profile lookup returns 401 without a
-  write. An author deletion after that lookup can cause an author foreign-key
+- A missing author during the existing JWT lookup returns 401 before the Comment
+  service runs. There is no second User lookup. An author deletion after
+  authentication can cause an author foreign-key
   failure; it is sanitized and logged as 500, never mislabeled as Article 404.
 - If insertion fails with `ER_NO_REFERENCED_ROW_2` specifically naming
-  `FK_comments_article_id`, the service checks the previously resolved Article
-  UUID again. Only confirmed absence becomes 404. Other foreign-key violations,
-  a still-present Article or a failed confirmation lookup remain unexpected
-  failures. Existing foreign keys prevent orphan comments without pessimistic
+  `FK_comments_article_id`, that exact constraint failure directly becomes the
+  existing localized Article 404 without another existence query. Author foreign
+  keys, lookalike constraint names, other driver codes and non-database failures
+  retain the sanitized/logged 500 behavior. Existing foreign keys prevent orphan comments without pessimistic
   locks or application cleanup.
 - Unexpected lookup/persistence failures return a Comment-domain 500. Nest Logger
   records the operation, error category and validated driver code, without raw
@@ -256,7 +280,11 @@ Run with Node.js 26.13.0 against the migrated isolated test services:
 ```powershell
 npm.cmd test -- --runInBand src/comments
 npm.cmd run test:e2e -- --runInBand comments.e2e-spec.ts --cacheDirectory=./node_modules/.cache/jest-pr5
-npm.cmd run format
+npm.cmd exec -- tsc --noEmit -p tsconfig.json
+npm.cmd exec -- tsc --noEmit -p tsconfig.build.json
+npm.cmd run test:migration:articles
+npm.cmd run test:migration:comments
+npm.cmd run test:migration:attachments
 npm.cmd run lint
 npm.cmd run build
 npm.cmd test -- --runInBand
@@ -273,7 +301,10 @@ persistence and timestamps, unchanged Articles and existing comments, own-Articl
 and repeated comments, current-slug lookup, input boundaries, authentication,
 Redis failure, translated errors, a real Article-deletion foreign-key race and
 Swagger. Cleanup targets only test-created users/records and revocation keys.
-Run E2E suites serially because existing database tests roundtrip migrations.
+Run ordinary E2E suites serially for shared fixture isolation. They require an
+already migrated schema and never revert historical migrations or drop tables.
+Destructive roundtrips run in separate disposable MySQL containers through the
+three dedicated commands; see [database reproduction and safety](comment-database.md#reproduce-from-a-fresh-checkout).
 No development or production database is used.
 
 Commit 4 adds service and HTTP tests for author-only deletion, cross-Article 404s
