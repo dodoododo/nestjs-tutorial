@@ -1,36 +1,30 @@
 import { ApiProperty } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
+import { IsDefined, ValidateNested } from 'class-validator';
+
 import {
-  IsDefined,
-  IsEmail,
-  IsNotEmpty,
-  IsString,
-  MaxLength,
-  ValidateBy,
-  ValidateNested,
-} from 'class-validator';
+  BCRYPT_MAX_BYTES,
+  EMAIL_MAX_LENGTH,
+  PASSWORD_MAX_LENGTH,
+} from '../constants/auth.constant';
+import {
+  IsPassword,
+  IsUserEmail,
+} from '../decorators/user-validation.decorator';
 
 export class LoginDto {
-  @ApiProperty({ example: 'jacob@example.com' })
-  @IsEmail()
-  @MaxLength(254)
+  @ApiProperty({ example: 'jacob@example.com', maxLength: EMAIL_MAX_LENGTH })
+  @IsUserEmail()
   email!: string;
 
   @ApiProperty({
     example: 'StrongPass123!',
+    minLength: 1,
+    maxLength: PASSWORD_MAX_LENGTH,
     writeOnly: true,
+    description: `Maximum ${BCRYPT_MAX_BYTES} UTF-8 bytes. Passwords are not normalized or truncated.`,
   })
-  @IsString()
-  @IsNotEmpty()
-  @MaxLength(72)
-  @ValidateBy({
-    name: 'maxBcryptPasswordBytes',
-    validator: {
-      validate: (value: unknown) =>
-        typeof value === 'string' && Buffer.byteLength(value, 'utf8') <= 72,
-      defaultMessage: () => 'password must not exceed 72 UTF-8 bytes',
-    },
-  })
+  @IsPassword(false)
   password!: string;
 }
 

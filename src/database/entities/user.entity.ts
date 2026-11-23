@@ -28,6 +28,9 @@ export class User {
   })
   passwordHash!: string;
 
+  @Column({ name: 'token_version', type: 'int', unsigned: true, default: 0 })
+  tokenVersion!: number;
+
   @Column({ type: 'text', nullable: true })
   bio!: string | null;
 

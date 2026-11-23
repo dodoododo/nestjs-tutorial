@@ -1,0 +1,6 @@
+{
+  "FILE_REQUIRED": "Vui lòng cung cấp tệp ảnh đại diện",
+  "INVALID_TYPE": "Chỉ chấp nhận ảnh đại diện JPEG, PNG và WebP",
+  "INVALID_IMAGE": "Ảnh đại diện phải hợp lệ, không có hoạt ảnh và khớp với loại MIME đã khai báo",
+  "TOO_LARGE": "Ảnh đại diện không được vượt quá 5 MiB"
+}

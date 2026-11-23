@@ -1,6 +1,7 @@
 import { INestApplication } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { Test } from '@nestjs/testing';
+import { getStorageToken, ThrottlerStorageService } from '@nestjs/throttler';
 import { compare } from 'bcrypt';
 import { randomUUID } from 'node:crypto';
 import request from 'supertest';
@@ -57,6 +58,12 @@ describe('Auth Registration (e2e)', () => {
     usersRepository = dataSource.getRepository(User);
   });
 
+  beforeEach(() => {
+    // Reset this app's real limiter, including hit expirations and its timer,
+    // so the throttling scenario cannot block login tests run after it.
+    app.get<ThrottlerStorageService>(getStorageToken()).onApplicationShutdown();
+  });
+
   afterEach(async () => {
     if (createdEmails.length > 0) {
       await usersRepository.delete({
@@ -68,6 +75,49 @@ describe('Auth Registration (e2e)', () => {
 
   afterAll(async () => {
     await app?.close();
+  });
+
+  it('normalizes registration before validation and preserves normalized uniqueness', async () => {
+    const user = createUser();
+    createdEmails.push(user.email);
+    const response = await request(app.getHttpServer())
+      .post('/api/users')
+      .send({
+        user: {
+          ...user,
+          username: `  ${user.username}  `,
+          email: `  ${user.email.toUpperCase()}  `,
+        },
+      })
+      .expect(201);
+    expect(response.body.user.username).toBe(user.username);
+    expect(response.body.user.email).toBe(user.email);
+    expect(response.body.user).not.toHaveProperty('tokenVersion');
+    const payload = await app
+      .get(JwtService)
+      .verifyAsync<{ tokenVersion: number }>(
+        response.body.user.token as string,
+      );
+    expect(payload.tokenVersion).toBe(0);
+    await request(app.getHttpServer())
+      .post('/api/users')
+      .send({
+        user: { ...createUser(), email: `  ${user.email.toUpperCase()}  ` },
+      })
+      .expect(409);
+    const login = await request(app.getHttpServer())
+      .post('/api/users/login')
+      .send({
+        user: {
+          email: `  ${user.email.toUpperCase()}  `,
+          password: user.password,
+        },
+      })
+      .expect(200);
+    await request(app.getHttpServer())
+      .get('/api/users')
+      .set('Authorization', `Bearer ${login.body.user.token}`)
+      .expect(200);
   });
 
   it('registers a user and returns a valid JWT', async () => {
@@ -271,7 +321,7 @@ describe('Auth Registration (e2e)', () => {
       statuses.push(response.status);
     }
 
-    expect(statuses).toContain(429);
+    expect(statuses).toEqual([401, 401, 401, 401, 401, 429]);
   });
 
   it('GET /api/users returns the authenticated user', async () => {

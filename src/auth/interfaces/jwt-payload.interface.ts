@@ -3,4 +3,6 @@ export interface JwtPayload {
   jti: string;
   iat?: number;
   exp: number;
+  // Absent only on legacy JWTs, interpreted as version 0.
+  tokenVersion?: number;
 }
