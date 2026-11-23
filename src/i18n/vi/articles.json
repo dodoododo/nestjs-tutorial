@@ -1,0 +1,8 @@
+{
+  "NOT_FOUND": "Không tìm thấy bài viết",
+  "NOT_AUTHOR": "Chỉ tác giả mới có thể sửa hoặc xóa bài viết này",
+  "SLUG_CONFLICT": "Không thể tạo đường dẫn bài viết duy nhất; vui lòng thử lại",
+  "ALREADY_FAVORITED": "Bạn đã yêu thích bài viết này",
+  "PERSISTENCE_FAILED": "Không thể lưu hoặc truy xuất bài viết",
+  "FAVORITE_INPUT_NOT_EMPTY": "Các API yêu thích bài viết không chấp nhận trường dữ liệu trong yêu cầu"
+}

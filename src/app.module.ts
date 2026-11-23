@@ -18,12 +18,14 @@ import {
 import { AuthModule } from './auth/auth.module';
 import { ProfilesModule } from './profiles/profiles.module';
 import { AvatarsModule } from './avatars/avatars.module';
+import { ArticlesModule } from './articles/articles.module';
 
 @Module({
   imports: [
     AuthModule,
     ProfilesModule,
     AvatarsModule,
+    ArticlesModule,
     ConfigModule.forRoot({
       isGlobal: true,
       envFilePath: process.env.NODE_ENV === 'test' ? '.env.test' : '.env',

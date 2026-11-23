@@ -89,6 +89,7 @@ describe('Polymorphic attachments (database e2e)', () => {
     await app?.close();
   });
 
+  // Allow real MySQL DDL and restoration to finish before the next test starts.
   it('runs down/up without changing users or follows and allows repeated migration runs', async () => {
     // Never drop preexisting attachment metadata, even in the test database.
     if ((await attachmentsRepository.count()) !== 0) {
@@ -147,7 +148,7 @@ describe('Polymorphic attachments (database e2e)', () => {
         await runner.release();
       }
     }
-  });
+  }, 30_000);
 
   it('matches the required columns, unsigned size and polymorphic index to the migration', async () => {
     const runner = dataSource.createQueryRunner();
