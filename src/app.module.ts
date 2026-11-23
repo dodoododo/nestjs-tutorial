@@ -19,6 +19,7 @@ import { AuthModule } from './auth/auth.module';
 import { ProfilesModule } from './profiles/profiles.module';
 import { AvatarsModule } from './avatars/avatars.module';
 import { ArticlesModule } from './articles/articles.module';
+import { CommentsModule } from './comments/comments.module';
 
 @Module({
   imports: [
@@ -26,6 +27,7 @@ import { ArticlesModule } from './articles/articles.module';
     ProfilesModule,
     AvatarsModule,
     ArticlesModule,
+    CommentsModule,
     ConfigModule.forRoot({
       isGlobal: true,
       envFilePath: process.env.NODE_ENV === 'test' ? '.env.test' : '.env',

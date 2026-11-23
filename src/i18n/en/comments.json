@@ -1,0 +1,8 @@
+{
+  "ARTICLE_NOT_FOUND": "Article not found for this comment",
+  "PERSISTENCE_FAILED": "Unable to create the comment",
+  "RETRIEVAL_FAILED": "Unable to retrieve comments",
+  "NOT_FOUND": "Comment not found in this article",
+  "NOT_AUTHOR": "Only the comment author may delete this comment",
+  "DELETION_FAILED": "Unable to delete the comment"
+}
