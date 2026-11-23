@@ -1,6 +1,5 @@
 import {
   BadRequestException,
-  ConflictException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
@@ -61,9 +60,13 @@ export class ProfilesService {
       if (
         error instanceof QueryFailedError &&
         (error.driverError as { code?: string }).code ===
-          MYSQL_DUPLICATE_ENTRY_CODE
+          MYSQL_DUPLICATE_ENTRY_CODE &&
+        /for key ['`](?:follows\.)?IDX_follows_follower_following_unique['`]/.test(
+          (error.driverError as { sqlMessage?: string }).sqlMessage ??
+            error.driverError.message,
+        )
       ) {
-        throw new ConflictException(this.i18n.t('profiles.ALREADY_FOLLOWING'));
+        return this.createProfileResponse(user, true);
       }
       throw error;
     }

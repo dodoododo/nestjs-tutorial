@@ -318,7 +318,7 @@ describe('Profile and follow APIs (e2e)', () => {
     expect(profile.body).toEqual(expectedProfile(true));
   });
 
-  it('returns a translated 409 for duplicate follows', async () => {
+  it('returns the same 200 profile for duplicate follows in Vietnamese', async () => {
     await followsRepository.insert({
       followerId: actor.id,
       followingId: target.id,
@@ -326,8 +326,8 @@ describe('Profile and follow APIs (e2e)', () => {
     const response = await request(app.getHttpServer())
       .post(`/api/profiles/${target.username}/follow?lang=vi`)
       .set('Authorization', `Bearer ${token}`)
-      .expect(409);
-    expect(response.body.message).toBe('Bạn đã theo dõi người dùng này');
+      .expect(200);
+    expect(response.body).toEqual(expectedProfile(true));
     expect(
       await followsRepository.countBy({
         followerId: actor.id,
@@ -336,7 +336,7 @@ describe('Profile and follow APIs (e2e)', () => {
     ).toBe(1);
   });
 
-  it('returns 200 and 409 for concurrent duplicate follows, never 500', async () => {
+  it('returns 200 for both concurrent follows with exactly one relationship', async () => {
     const responses = await Promise.all([
       profileRequest('post', target.username, `Bearer ${token}`),
       profileRequest('post', target.username, `Bearer ${token}`),
@@ -345,10 +345,10 @@ describe('Profile and follow APIs (e2e)', () => {
       responses
         .map((response) => response.status)
         .sort((left, right) => left - right),
-    ).toEqual([200, 409]);
-    expect(responses.find((response) => response.status === 200)!.body).toEqual(
-      expectedProfile(true),
-    );
+    ).toEqual([200, 200]);
+    for (const response of responses) {
+      expect(response.body).toEqual(expectedProfile(true));
+    }
     expect(
       await followsRepository.countBy({
         followerId: actor.id,
@@ -468,8 +468,9 @@ describe('Profile and follow APIs (e2e)', () => {
     ]);
     const follow = paths['/api/profiles/{username}/follow'];
     expect(follow.post.security).toEqual([{ bearer: [] }]);
+    expect(follow.post.responses).not.toHaveProperty('409');
     expect(follow.delete.security).toEqual([{ bearer: [] }]);
-    for (const status of ['200', '400', '401', '404', '409', '503']) {
+    for (const status of ['200', '400', '401', '404', '503']) {
       expect(follow.post.responses).toHaveProperty(status);
     }
     const profile = response.body.components.schemas.ProfileDto;

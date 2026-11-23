@@ -11,7 +11,6 @@ import {
 import {
   ApiBadRequestResponse,
   ApiBearerAuth,
-  ApiConflictResponse,
   ApiNotFoundResponse,
   ApiOkResponse,
   ApiOperation,
@@ -59,9 +58,12 @@ export class ProfilesController {
   @HttpCode(HttpStatus.OK)
   @UseGuards(JwtAuthGuard)
   @ApiBearerAuth()
-  @ApiOperation({ summary: 'Follow a user' })
+  @ApiOperation({
+    summary: 'Follow a user',
+    description:
+      'Idempotent: returns 200 with following: true even if the relationship already exists.',
+  })
   @ApiBadRequestResponse({ description: 'Cannot follow yourself' })
-  @ApiConflictResponse({ description: 'Already following this user' })
   follow(
     @Param('username') username: string,
     @CurrentUser() principal: AuthenticatedPrincipal,
