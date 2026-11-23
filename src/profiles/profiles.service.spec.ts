@@ -1,8 +1,4 @@
-import {
-  BadRequestException,
-  ConflictException,
-  NotFoundException,
-} from '@nestjs/common';
+import { BadRequestException, NotFoundException } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { I18nService } from 'nestjs-i18n';
@@ -23,7 +19,6 @@ describe('ProfilesService', () => {
   const messages: Record<string, string> = {
     'profiles.NOT_FOUND': 'Profile not found',
     'profiles.SELF_FOLLOW': 'You cannot follow yourself',
-    'profiles.ALREADY_FOLLOWING': 'You are already following this user',
   };
   const i18n = { t: jest.fn((key: string) => messages[key]) };
   const target = {
@@ -118,23 +113,39 @@ describe('ProfilesService', () => {
     expect(followsRepository.insert).not.toHaveBeenCalled();
   });
 
-  it('translates database duplicate-key errors into 409, including races', async () => {
+  it('returns success for an expected duplicate pair, including races', async () => {
     followsRepository.insert.mockRejectedValue(
       new QueryFailedError(
         'INSERT INTO follows',
         [],
-        Object.assign(new Error('Duplicate pair'), { code: 'ER_DUP_ENTRY' }),
+        Object.assign(
+          new Error(
+            "Duplicate entry for key 'follows.IDX_follows_follower_following_unique'",
+          ),
+          { code: 'ER_DUP_ENTRY' },
+        ),
       ),
     );
     await expect(
       service.follow(target.username, 'current-user'),
-    ).rejects.toThrow(
-      new ConflictException('You are already following this user'),
-    );
+    ).resolves.toEqual({ profile: { ...publicProfile, following: true } });
+    expect(followsRepository.existsBy).not.toHaveBeenCalled();
   });
 
   it.each([
     new Error('Database unavailable'),
+    new QueryFailedError(
+      'INSERT INTO follows',
+      [],
+      Object.assign(new Error("Duplicate entry for key 'PRIMARY'"), {
+        code: 'ER_DUP_ENTRY',
+      }),
+    ),
+    new QueryFailedError(
+      'INSERT INTO follows',
+      [],
+      Object.assign(new Error('Duplicate entry'), { code: 'ER_DUP_ENTRY' }),
+    ),
     new QueryFailedError(
       'INSERT INTO follows',
       [],

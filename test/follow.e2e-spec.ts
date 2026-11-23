@@ -7,6 +7,7 @@ import { AppModule } from '../src/app.module';
 import { INVALID_USER_PASSWORD_HASH } from '../src/auth/constants/auth.constant';
 import { Follow } from '../src/database/entities/follow.entity';
 import { User } from '../src/database/entities/user.entity';
+import { ProfilesService } from '../src/profiles/profiles.service';
 
 describe('Follow relationships (database e2e)', () => {
   let app: INestApplication;
@@ -184,6 +185,46 @@ describe('Follow relationships (database e2e)', () => {
       driverError: { code: 'ER_DUP_ENTRY' },
     });
     expect(await followsRepository.countBy(pair)).toBe(1);
+  });
+
+  it('handles a burst of service follows idempotently without changing other relationships', async () => {
+    const reverse = { followerId: following.id, followingId: follower.id };
+    const unrelated = { followerId: other.id, followingId: following.id };
+    // insert() adds generated fields to its inputs; keep these predicates scoped to IDs.
+    await followsRepository.insert([{ ...reverse }, { ...unrelated }]);
+    const results = await Promise.all(
+      Array.from({ length: 6 }, () =>
+        app.get(ProfilesService).follow(following.username, follower.id),
+      ),
+    );
+    for (const result of results) {
+      expect(result).toEqual({
+        profile: {
+          username: following.username,
+          bio: following.bio,
+          image: following.image,
+          following: true,
+        },
+      });
+    }
+    expect(
+      await followsRepository.countBy({
+        followerId: follower.id,
+        followingId: following.id,
+      }),
+    ).toBe(1);
+    expect(await followsRepository.countBy(reverse)).toBe(1);
+    expect(await followsRepository.countBy(unrelated)).toBe(1);
+    await app.get(ProfilesService).unfollow(following.username, follower.id);
+    await app.get(ProfilesService).unfollow(following.username, follower.id);
+    expect(
+      await followsRepository.countBy({
+        followerId: follower.id,
+        followingId: following.id,
+      }),
+    ).toBe(0);
+    expect(await followsRepository.countBy(reverse)).toBe(1);
+    expect(await followsRepository.countBy(unrelated)).toBe(1);
   });
 
   it('allows reciprocal follows and multiple incoming and outgoing relationships', async () => {
