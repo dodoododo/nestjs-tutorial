@@ -1,5 +1,4 @@
 import {
-  BadRequestException,
   ConflictException,
   ForbiddenException,
   Injectable,
@@ -13,7 +12,6 @@ import {
   DataSource,
   EntityManager,
   In,
-  Not,
   QueryFailedError,
   SelectQueryBuilder,
 } from 'typeorm';
@@ -23,7 +21,10 @@ import { ArticleFavorite } from '../database/entities/article-favorite.entity';
 import { Follow } from '../database/entities/follow.entity';
 import { Tag } from '../database/entities/tag.entity';
 import { User } from '../database/entities/user.entity';
-import { ARTICLE_TRANSACTION_MAX_ATTEMPTS } from './constants/article.constant';
+import {
+  ARTICLE_SLUG_MAX_ATTEMPTS,
+  ARTICLE_TRANSACTION_MAX_ATTEMPTS,
+} from './constants/article.constant';
 import { CreateArticleDto, normalizeTag } from './dto/create-article.dto';
 import { ArticleResponseDto } from './dto/article-response.dto';
 import { UpdateArticleDto } from './dto/update-article.dto';
@@ -46,8 +47,9 @@ function isSlugConflict(error: unknown): boolean {
   return (
     mysqlCode(error) === 'ER_DUP_ENTRY' &&
     error instanceof QueryFailedError &&
-    /IDX_articles_slug_unique/.test(
-      (error.driverError as { message?: string }).message ?? '',
+    /for key ['`](?:articles\.)?IDX_articles_slug_unique['`]$/i.test(
+      (error.driverError as { sqlMessage?: string }).sqlMessage ??
+        error.driverError.message,
     )
   );
 }
@@ -83,62 +85,47 @@ export class ArticlesService {
     dto: CreateArticleDto,
     authorId: string,
   ): Promise<ArticleResponseDto> {
-    const slug = articleSlug(dto.title);
-    this.assertRoutableSlug(slug);
+    let slug = articleSlug(dto.title);
+    const usedSlugs = new Set([slug]);
+    const id = randomUUID();
     const names = [...new Set((dto.tagList ?? []).map(normalizeTag))].sort();
-    for (let attempt = 1; ; attempt++) {
-      try {
-        return await this.dataSource.transaction(
-          'READ COMMITTED',
-          async (manager) => {
-            const id = randomUUID();
-            try {
-              await manager.insert(Article, {
-                id,
-                slug,
-                title: dto.title,
-                description: dto.description,
-                body: dto.body,
-                authorId,
-              });
-            } catch (error: unknown) {
-              if (isSlugConflict(error)) {
-                throw new ConflictException(
-                  this.i18n.t('articles.SLUG_CONFLICT'),
-                );
-              }
-              throw error;
-            }
-
-            if (names.length) {
-              // A no-op duplicate update respects MySQL collation and concurrent
-              // inserts without INSERT IGNORE hiding unrelated persistence errors.
-              await manager.query(
-                `INSERT INTO tags (id, name) VALUES ${names.map(() => '(?, ?)').join(', ')} ON DUPLICATE KEY UPDATE id = id`,
-                names.flatMap((name) => [randomUUID(), name]),
-              );
-              const tags = await manager.find(Tag, {
-                where: { name: In(names) },
-                select: { id: true },
-              });
-              await manager.insert(
-                ArticleTag,
-                tags.map((tag) => ({ articleId: id, tagId: tag.id })),
-              );
-            }
-            return this.loadArticle(manager, slug, authorId);
-          },
-        );
-      } catch (error: unknown) {
-        // MySQL rolls a deadlocked transaction back. Retry all work, boundedly.
-        if (
-          mysqlCode(error) === 'ER_LOCK_DEADLOCK' &&
-          attempt < ARTICLE_TRANSACTION_MAX_ATTEMPTS
-        )
-          continue;
-        this.handlePersistenceError(error);
-      }
-    }
+    return this.runMutation(
+      async (manager) => {
+        await manager.insert(Article, {
+          id,
+          slug,
+          title: dto.title,
+          description: dto.description,
+          body: dto.body,
+          authorId,
+        });
+        if (names.length) {
+          // A no-op duplicate update respects MySQL collation and concurrent
+          // inserts without INSERT IGNORE hiding unrelated persistence errors.
+          await manager.query(
+            `INSERT INTO tags (id, name) VALUES ${names.map(() => '(?, ?)').join(', ')} ON DUPLICATE KEY UPDATE id = id`,
+            names.flatMap((name) => [randomUUID(), name]),
+          );
+          const tags = await manager.find(Tag, {
+            where: { name: In(names) },
+            select: { id: true },
+          });
+          await manager.insert(
+            ArticleTag,
+            tags.map((tag) => ({ articleId: id, tagId: tag.id })),
+          );
+        }
+        return this.loadArticle(manager, slug, authorId);
+      },
+      undefined,
+      () => {
+        const candidate = articleSlug(dto.title);
+        if (usedSlugs.has(candidate)) return false;
+        usedSlugs.add(candidate);
+        slug = candidate;
+        return true;
+      },
+    );
   }
 
   async getArticle(
@@ -339,34 +326,45 @@ export class ArticlesService {
     dto: UpdateArticleDto,
     authorId: string,
   ): Promise<ArticleResponseDto> {
-    return this.runMutation(async (manager) => {
-      const article = await this.findOwnedArticle(manager, slug, authorId);
-      const changes: Partial<
-        Pick<Article, 'title' | 'description' | 'body' | 'slug'>
-      > = {};
-      if (dto.title !== undefined && dto.title !== article.title) {
-        changes.title = dto.title;
-        changes.slug = articleSlug(dto.title);
-        this.assertRoutableSlug(changes.slug);
-        if (
-          changes.slug !== article.slug &&
-          (await manager.existsBy(Article, {
-            slug: changes.slug,
-            id: Not(article.id),
-          }))
-        ) {
-          throw new ConflictException(this.i18n.t('articles.SLUG_CONFLICT'));
+    let candidateSlug: string | undefined;
+    const usedSlugs = new Set<string>();
+    return this.runMutation(
+      async (manager) => {
+        const article = await this.findOwnedArticle(manager, slug, authorId);
+        const changes: Partial<
+          Pick<Article, 'title' | 'description' | 'body' | 'slug'>
+        > = {};
+        if (dto.title !== undefined && dto.title !== article.title) {
+          changes.title = dto.title;
+          candidateSlug ??= articleSlug(dto.title);
+          usedSlugs.add(candidateSlug);
+          changes.slug = candidateSlug;
         }
-      }
-      if (dto.description !== undefined) changes.description = dto.description;
-      if (dto.body !== undefined) changes.body = dto.body;
-      if (Object.keys(changes).length) {
-        // Write only supplied fields, with stable identity and ownership scope.
-        // The unique slug index still arbitrates races after the precheck.
-        await manager.update(Article, { id: article.id, authorId }, changes);
-      }
-      return this.loadArticle(manager, changes.slug ?? article.slug, authorId);
-    });
+        if (dto.description !== undefined)
+          changes.description = dto.description;
+        if (dto.body !== undefined) changes.body = dto.body;
+        if (Object.keys(changes).length) {
+          // Write only supplied fields, with stable identity and ownership scope.
+          // The unique slug index arbitrates collisions without a precheck query.
+          await manager.update(Article, { id: article.id, authorId }, changes);
+        }
+        return this.loadArticle(
+          manager,
+          changes.slug ?? article.slug,
+          authorId,
+        );
+      },
+      undefined,
+      () => {
+        if (dto.title === undefined || candidateSlug === undefined)
+          return false;
+        const candidate = articleSlug(dto.title);
+        if (usedSlugs.has(candidate)) return false;
+        usedSlugs.add(candidate);
+        candidateSlug = candidate;
+        return true;
+      },
+    );
   }
 
   async deleteArticle(slug: string, authorId: string): Promise<void> {
@@ -375,13 +373,6 @@ export class ArticlesService {
       // Existing foreign keys cascade links/favorites; reusable tags survive.
       await manager.delete(Article, { id: article.id, authorId });
     });
-  }
-
-  private assertRoutableSlug(slug: string): void {
-    // GET /articles/feed is a static route, so it cannot address an article.
-    if (slug === 'feed') {
-      throw new BadRequestException(this.i18n.t('articles.RESERVED_SLUG'));
-    }
   }
 
   favoriteArticle(slug: string, userId: string): Promise<ArticleResponseDto> {
@@ -458,17 +449,25 @@ export class ArticlesService {
   private async runMutation<T>(
     operation: (manager: EntityManager) => Promise<T>,
     context?: FavoriteMutationContext,
+    regenerateSlug?: () => boolean,
   ): Promise<T> {
-    for (let attempt = 1; ; attempt++) {
+    let slugAttempts = 1;
+    for (let attempt = 1; ;) {
       try {
         return await this.dataSource.transaction('READ COMMITTED', operation);
       } catch (error: unknown) {
         if (
           mysqlCode(error) === 'ER_LOCK_DEADLOCK' &&
           attempt < ARTICLE_TRANSACTION_MAX_ATTEMPTS
-        )
+        ) {
+          attempt++;
           continue;
+        }
         if (context === undefined && isSlugConflict(error)) {
+          if (slugAttempts < ARTICLE_SLUG_MAX_ATTEMPTS && regenerateSlug?.()) {
+            slugAttempts++;
+            continue;
+          }
           throw new ConflictException(this.i18n.t('articles.SLUG_CONFLICT'));
         }
         this.handlePersistenceError(error, context);

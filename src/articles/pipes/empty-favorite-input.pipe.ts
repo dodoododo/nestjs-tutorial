@@ -1,7 +1,10 @@
 import { BadRequestException, Injectable, PipeTransform } from '@nestjs/common';
+import { I18nService } from 'nestjs-i18n';
 
 @Injectable()
 export class EmptyFavoriteInputPipe implements PipeTransform<unknown, void> {
+  constructor(private readonly i18n: I18nService) {}
+
   transform(value: unknown): void {
     if (
       value === undefined ||
@@ -12,7 +15,7 @@ export class EmptyFavoriteInputPipe implements PipeTransform<unknown, void> {
     )
       return;
     throw new BadRequestException(
-      'Favorite endpoints accept no request fields',
+      this.i18n.t('articles.FAVORITE_INPUT_NOT_EMPTY'),
     );
   }
 }

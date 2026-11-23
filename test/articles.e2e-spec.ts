@@ -31,7 +31,8 @@ import {
 } from '../src/redis/redis.constant';
 import { RedisService } from '../src/redis/redis.service';
 import { setupSwagger } from '../src/swagger';
-import { articleSlug } from '../src/articles/utils/article-slug.util';
+import * as slugUtil from '../src/articles/utils/article-slug.util';
+import { ARTICLE_SLUG_MAX_LENGTH } from '../src/articles/constants/article.constant';
 
 describe('Article APIs (e2e)', () => {
   let app: INestApplication;
@@ -240,7 +241,9 @@ describe('Article APIs (e2e)', () => {
     const article = (result.body as ArticleResponseDto).article;
     expect(result.body).toEqual({
       article: {
-        slug: `duong-den-${prefix}`,
+        slug: expect.stringMatching(
+          new RegExp(`^duong-den-${prefix}-[0-9a-f]{12}$`),
+        ),
         title: `Đường đến ${prefix}`,
         description: 'Description',
         body: payload.body,
@@ -271,54 +274,80 @@ describe('Article APIs (e2e)', () => {
     expect(await articles.countBy({ authorId: author.id })).toBe(0);
   });
 
-  it.each(['feed', 'FEED', 'Fééd', 'ＦＥＥＤ'])(
-    'rejects the reserved generated slug for %j on Create and Update without persisting changes',
+  it.each(['feed', 'FEED', 'F\u00e9\u00e9d', '\uff26\uff25\uff25\uff24'])(
+    'creates and updates the reserved-looking title %j using routable suffixed slugs',
     async (title) => {
       const created = await post(
-        input({ title, tagList: [tag('reserved')] }),
-      ).expect(400);
-      expect(created.body.message).toBe(
-        "This title produces the reserved article slug 'feed'; choose a different title",
+        input({ title, tagList: [tag('feed')] }),
+      ).expect(201);
+      expect(created.body.article.slug).toMatch(/^feed-[0-9a-f]{12}$/);
+      expect((await get(created.body.article.slug).expect(200)).body).toEqual(
+        created.body,
       );
-      expect(await articles.countBy({ authorId: author.id })).toBe(0);
-      expect(await tags.countBy({ name: tag('reserved') })).toBe(0);
       const article = await create({ tagList: [tag('preserved')] });
       const before = await articles.findOneByOrFail({ slug: article.slug });
       const updated = await mutate('put', article.slug, {
         title,
-        body: 'Must not persist',
-      }).expect(400);
-      expect(updated.body.message).toBe(created.body.message);
-      expect(await articles.findOneByOrFail({ id: before.id })).toEqual(before);
-      expect((await get(article.slug).expect(200)).body.article).toEqual(
-        article,
+        body: 'Updated body',
+      }).expect(200);
+      expect(updated.body.article.slug).toMatch(/^feed-[0-9a-f]{12}$/);
+      expect(updated.body.article.slug).not.toBe(created.body.article.slug);
+      expect(await articles.findOneByOrFail({ id: before.id })).toMatchObject({
+        authorId: before.authorId,
+        title,
+        body: 'Updated body',
+      });
+      expect(updated.body.article.tagList).toEqual(article.tagList);
+      expect((await get(updated.body.article.slug).expect(200)).body).toEqual(
+        updated.body,
       );
+      await get(article.slug).expect(404);
       await get('feed').expect(401);
     },
   );
 
-  it('localizes reserved slugs and allows other slugs resembling feed', async () => {
-    const message =
-      "Tiêu đề này tạo đường dẫn bài viết 'feed' đã được dành riêng; vui lòng chọn tiêu đề khác";
+  it('allows feed-like titles independently of the selected locale', async () => {
     const response = await post(input({ title: 'Feed' }))
       .set('x-lang', 'vi')
-      .expect(400);
-    expect(response.body.message).toBe(message);
+      .expect(201);
+    expect(response.body.article.slug).toMatch(/^feed-[0-9a-f]{12}$/);
     const article = await create({ title: 'Feed news' });
-    expect(article.slug).toBe('feed-news');
-    expect((await get(article.slug).expect(200)).body.article).toEqual(article);
-    expect(
-      (
-        await mutate('put', article.slug, { title: 'Feed' })
-          .set('x-lang', 'vi')
-          .expect(400)
-      ).body.message,
-    ).toBe(message);
-    const updated = await mutate('put', article.slug, {
-      title: 'Feed archive',
-    }).expect(200);
-    expect(updated.body.article.slug).toBe('feed-archive');
-    expect((await get('feed-archive').expect(200)).body).toEqual(updated.body);
+    expect(article.slug).toMatch(/^feed-news-[0-9a-f]{12}$/);
+    const updated = await mutate('put', article.slug, { title: 'Feed archive' })
+      .set('x-lang', 'vi')
+      .expect(200);
+    expect(updated.body.article.slug).toMatch(/^feed-archive-[0-9a-f]{12}$/);
+    expect((await get(updated.body.article.slug).expect(200)).body).toEqual(
+      updated.body,
+    );
+  });
+
+  it.each(['\ufb03'.repeat(255), '\u{10400}'.repeat(255)])(
+    'persists and routes safely truncated Unicode titles (case %#)',
+    async (title) => {
+      const article = await create({ title });
+      expect(article.slug.length).toBeLessThanOrEqual(ARTICLE_SLUG_MAX_LENGTH);
+      expect(article.slug).not.toMatch(/\p{Surrogate}/u);
+      expect(article.slug).toMatch(/-[0-9a-f]{12}$/);
+      expect((await get(article.slug).expect(200)).body.article).toEqual(
+        article,
+      );
+      expect(
+        (await articles.findOneByOrFail({ slug: article.slug })).title,
+      ).toBe(title);
+    },
+  );
+
+  it('keeps Article authentication compatible with PR3 legacy and current token versions', async () => {
+    const article = await create();
+    await get(article.slug, `Bearer ${token}`).expect(200);
+    await users.update(author.id, { tokenVersion: 1 });
+    await get(article.slug, `Bearer ${token}`).expect(401);
+    const fresh = await app
+      .get(JwtService)
+      .signAsync({ sub: author.id, jti: randomUUID(), tokenVersion: 1 });
+    await get(article.slug, `Bearer ${fresh}`).expect(200);
+    await post(input(), `Bearer ${fresh}`).expect(201);
   });
 
   it.each([
@@ -520,20 +549,72 @@ describe('Article APIs (e2e)', () => {
     ).toBe(6);
   });
 
-  it('returns 409 for equivalent slugs including concurrent creates without overwriting', async () => {
-    const title = `Đường ${prefix}`;
+  it('allows multiple same-title articles for the same and different authors without overwriting', async () => {
+    const viewerToken = await app
+      .get(JwtService)
+      .signAsync({ sub: viewer.id, jti: randomUUID(), tokenVersion: 0 });
     const responses = await Promise.all([
-      post(input({ title })),
-      post(input({ title: `DUONG ${prefix}!` })),
+      post(input({ title: 'Hello World' })).expect(201),
+      post(input({ title: 'Hello World' })).expect(201),
+      post(input({ title: 'Hello World' }), `Bearer ${viewerToken}`).expect(
+        201,
+      ),
+      post(input({ title: `\u0110\u01b0\u1eddng ${prefix}` })).expect(201),
+      post(input({ title: `DUONG ${prefix}!` })).expect(201),
     ]);
     expect(
-      responses.map((response) => response.status).sort((a, b) => a - b),
-    ).toEqual([201, 409]);
-    expect(await articles.countBy({ authorId: author.id })).toBe(1);
-    const successful = responses.find((response) => response.status === 201)!;
-    expect((await get(successful.body.article.slug).expect(200)).body).toEqual(
-      successful.body,
+      new Set(responses.map((response) => response.body.article.slug)).size,
+    ).toBe(5);
+    expect(
+      await articles.countBy({ authorId: In([author.id, viewer.id]) }),
+    ).toBe(5);
+    for (const [index, response] of responses.entries()) {
+      const slug = response.body.article.slug as string;
+      expect(slug).toMatch(
+        index < 3
+          ? /^hello-world-[0-9a-f]{12}$/
+          : new RegExp(`^duong-${prefix}-[0-9a-f]{12}$`),
+      );
+      expect((await get(slug).expect(200)).body).toEqual(response.body);
+      expect((await articles.findOneByOrFail({ slug })).authorId).toBe(
+        index === 2 ? viewer.id : author.id,
+      );
+    }
+  });
+
+  it('recovers from a forced real unique-index collision on Create without changing the occupied article', async () => {
+    const occupied = await create({ tagList: [tag('occupied')] });
+    const before = await articles.findOneByOrFail({ slug: occupied.slug });
+    const candidate = `new-${prefix}-000000000001`;
+    jest
+      .spyOn(slugUtil, 'articleSlug')
+      .mockReturnValueOnce(occupied.slug)
+      .mockReturnValueOnce(candidate);
+    const response = await post(
+      input({ title: 'New', tagList: [tag('retry')] }),
+    ).expect(201);
+    expect(response.body.article.slug).toBe(candidate);
+    expect(await articles.findOneByOrFail({ id: before.id })).toEqual(before);
+    expect(await articles.countBy({ authorId: author.id })).toBe(2);
+    expect(response.body.article.tagList).toEqual([tag('retry')]);
+  });
+
+  it('bounds forced Create collisions and rolls back new article/tag data with a localized 409', async () => {
+    const occupied = await Promise.all(
+      Array.from({ length: 3 }, () => create()),
     );
+    const before = await articles.findBy({ authorId: author.id });
+    const slug = jest.spyOn(slugUtil, 'articleSlug');
+    for (const article of occupied) slug.mockReturnValueOnce(article.slug);
+    const response = await post(input({ tagList: [tag('not-written')] }))
+      .set('x-lang', 'vi')
+      .expect(409);
+    expect(response.body.message).toBe(
+      'Kh\u00f4ng th\u1ec3 t\u1ea1o \u0111\u01b0\u1eddng d\u1eabn b\u00e0i vi\u1ebft duy nh\u1ea5t; vui l\u00f2ng th\u1eed l\u1ea1i',
+    );
+    expect(await articles.findBy({ authorId: author.id })).toEqual(before);
+    expect(await tags.countBy({ name: tag('not-written') })).toBe(0);
+    expect(slug).toHaveBeenCalledTimes(3);
   });
 
   it('reads favorite counts and viewer-specific favorite/follow state without join multiplication', async () => {
@@ -690,7 +771,9 @@ describe('Article APIs (e2e)', () => {
       const updated = (response.body as ArticleResponseDto).article;
       expect(response.body).toEqual({
         article: {
-          slug: `duong-di-moi-${prefix}`,
+          slug: expect.stringMatching(
+            new RegExp(`^duong-di-moi-${prefix}-[0-9a-f]{12}$`),
+          ),
           title,
           description: article.description,
           body: article.body,
@@ -774,7 +857,9 @@ describe('Article APIs (e2e)', () => {
         body: '\nNew body\n',
       }).expect(200);
       expect(result.body.article).toMatchObject({
-        slug: `changed-${prefix}`,
+        slug: expect.stringMatching(
+          new RegExp(`^changed-${prefix}-[0-9a-f]{12}$`),
+        ),
         title,
         description: 'New description',
         body: '\nNew body\n',
@@ -791,69 +876,130 @@ describe('Article APIs (e2e)', () => {
       expect(result.body.article.slug).toBe(customSlug);
     });
 
-    it('allows the same article to keep a database-equivalent slug', async () => {
+    it('gives an equivalent changed title a fresh slug', async () => {
       const title = `Café ${prefix}`;
       const article = await create({ title });
       await articles.update({ slug: article.slug }, { slug: `CAFÉ-${prefix}` });
       const result = await mutate('put', `CAFÉ-${prefix}`, {
         title: `CAFE ${prefix}!`,
       }).expect(200);
-      expect(result.body.article.slug).toBe(`cafe-${prefix}`);
+      expect(result.body.article.slug).toMatch(
+        new RegExp(`^cafe-${prefix}-[0-9a-f]{12}$`),
+      );
       expect(await articles.countBy({ authorId: author.id })).toBe(1);
     });
 
-    it('returns 409 for another database-equivalent slug without persisting other fields', async () => {
-      const first = await create();
+    it('retries a forced Update collision while preserving both articles and their relationships', async () => {
+      const first = await create({ tagList: [tag('preserved')] });
       const occupied = await create();
-      await articles.update(
-        { slug: occupied.slug },
-        { slug: `CAFÉ-${prefix}` },
-      );
       const before = await articles.findOneByOrFail({ slug: first.slug });
-      await mutate('put', first.slug, {
-        title: `cafe ${prefix}`,
-        description: 'must roll back',
-      }).expect(409);
-      expect(await articles.findOneByOrFail({ id: before.id })).toEqual(before);
-      expect((await get(`CAFÉ-${prefix}`).expect(200)).body.article.title).toBe(
-        occupied.title,
+      const occupiedBefore = await articles.findOneByOrFail({
+        slug: occupied.slug,
+      });
+      await dataSource
+        .getRepository(ArticleFavorite)
+        .insert({ articleId: before.id, userId: viewer.id });
+      const candidate = `updated-${prefix}-000000000001`;
+      jest
+        .spyOn(slugUtil, 'articleSlug')
+        .mockReturnValueOnce(occupied.slug)
+        .mockReturnValueOnce(candidate);
+      const result = await mutate('put', first.slug, {
+        title: 'Changed',
+        description: 'Changed description',
+      }).expect(200);
+      expect(result.body.article).toMatchObject({
+        slug: candidate,
+        title: 'Changed',
+        tagList: first.tagList,
+        favoritesCount: 1,
+      });
+      expect(await articles.findOneByOrFail({ id: before.id })).toMatchObject({
+        id: before.id,
+        slug: candidate,
+        authorId: before.authorId,
+        body: before.body,
+      });
+      expect(await articles.findOneByOrFail({ id: occupiedBefore.id })).toEqual(
+        occupiedBefore,
+      );
+      await get(first.slug).expect(404);
+      expect((await get(candidate).expect(200)).body.article.slug).toBe(
+        candidate,
       );
     });
 
-    it('resolves simultaneous slug collisions through the unique index after both prechecks pass', async () => {
+    it('rolls back every supplied Update field when all slug candidates collide', async () => {
+      const first = await create({ tagList: [tag('unchanged')] });
+      const before = await articles.findOneByOrFail({ slug: first.slug });
+      await dataSource
+        .getRepository(ArticleFavorite)
+        .insert({ articleId: before.id, userId: viewer.id });
+      const occupied = await Promise.all(
+        Array.from({ length: 3 }, () => create()),
+      );
+      const slug = jest.spyOn(slugUtil, 'articleSlug');
+      for (const article of occupied) slug.mockReturnValueOnce(article.slug);
+      const response = await mutate('put', first.slug, {
+        title: 'Changed',
+        description: 'Must roll back',
+        body: 'Must roll back',
+      }).expect(409);
+      expect(response.body.message).toBe(
+        'Unable to generate a unique article slug; please retry',
+      );
+      expect(await articles.findOneByOrFail({ id: before.id })).toEqual(before);
+      expect((await get(first.slug).expect(200)).body.article).toMatchObject({
+        tagList: first.tagList,
+        favoritesCount: 1,
+      });
+      expect(slug).toHaveBeenCalledTimes(3);
+    });
+
+    it('resolves concurrent forced slug collisions through the unique index without precheck queries', async () => {
       const first = await create();
       const second = await create();
       const title = `Collision ${prefix}`;
-      const exists = jest.spyOn(EntityManager.prototype, 'existsBy');
-      const original = exists.getMockImplementation()!;
+      const candidate = `collision-${prefix}-000000000001`;
+      jest
+        .spyOn(slugUtil, 'articleSlug')
+        .mockReturnValueOnce(candidate)
+        .mockReturnValueOnce(candidate);
+      const update = jest.spyOn(EntityManager.prototype, 'update');
+      const original = update.getMockImplementation()!;
       let arrivals = 0;
       let release!: () => void;
       const barrier = new Promise<void>((resolve) => {
         release = resolve;
       });
-      exists.mockImplementation(async function (
+      update.mockImplementation(async function (
         this: EntityManager,
         entity,
-        where,
+        criteria,
+        partial,
       ) {
-        const result = await original.call(this, entity, where);
-        if (entity === Article) {
-          arrivals++;
-          if (arrivals === 2) release();
+        if (entity === Article && arrivals < 2) {
+          if (++arrivals === 2) release();
           await barrier;
         }
-        return result;
+        return original.call(this, entity, criteria, partial);
       });
+      const exists = jest.spyOn(EntityManager.prototype, 'existsBy');
       const results = await Promise.all([
-        mutate('put', first.slug, { title }),
-        mutate('put', second.slug, { title }),
+        mutate('put', first.slug, { title }).expect(200),
+        mutate('put', second.slug, { title }).expect(200),
       ]);
-      expect(
-        results.map((response) => response.status).sort((a, b) => a - b),
-      ).toEqual([200, 409]);
       expect(arrivals).toBe(2);
-      expect(await articles.countBy({ slug: articleSlug(title) })).toBe(1);
-      expect(await articles.countBy({ authorId: author.id })).toBe(2);
+      expect(exists).not.toHaveBeenCalled();
+      const slugs = results.map(
+        (response) => response.body.article.slug as string,
+      );
+      expect(new Set(slugs).size).toBe(2);
+      expect(
+        await articles.countBy({ slug: In(slugs), authorId: author.id }),
+      ).toBe(2);
+      await get(first.slug).expect(404);
+      await get(second.slug).expect(404);
     });
 
     it('serializes disjoint updates without losing omitted fields', async () => {
@@ -1541,7 +1687,7 @@ describe('Article APIs (e2e)', () => {
     });
 
     it('requires authentication and matches the static route even when an article has slug feed', async () => {
-      // Simulate a legacy/directly inserted row: new API writes reject feed.
+      // Simulate a legacy/directly inserted row: new API writes suffix feed titles.
       const legacy = await create();
       await articles.update({ slug: legacy.slug }, { slug: 'feed' });
       const ordinary = await create();
@@ -1873,6 +2019,58 @@ describe('Article APIs (e2e)', () => {
         (await get(article.slug, otherAuthorization).expect(200)).body.article,
       ).toMatchObject({ favorited: true, favoritesCount: 1 });
     });
+
+    describe.each(['post', 'delete'] as const)(
+      '%s input localization',
+      (method) => {
+        it.each([
+          ['en', 'body', 'header'],
+          ['vi', 'body', 'header'],
+          ['en', 'query', 'header'],
+          ['vi', 'query', 'header'],
+          ['vi', 'body', 'query'],
+          ['vi', 'query', 'accept'],
+        ] as const)(
+          'localizes invalid %s %s input through the %s locale selector',
+          async (lang, location, selector) => {
+            const article = await create();
+            const req = favorite(method, article.slug, viewerAuthorization);
+            if (selector === 'header') req.set('x-lang', lang);
+            else if (selector === 'accept') req.set('Accept-Language', lang);
+            else req.query({ lang });
+            if (location === 'body') req.send({ unknown: true });
+            else req.query({ unknown: 'value' });
+            const response = await req.expect(400);
+            expect(response.body).toEqual({
+              statusCode: 400,
+              error: 'Bad Request',
+              message:
+                lang === 'en'
+                  ? 'Favorite endpoints accept no request fields'
+                  : 'C\u00e1c API y\u00eau th\u00edch b\u00e0i vi\u1ebft kh\u00f4ng ch\u1ea5p nh\u1eadn tr\u01b0\u1eddng d\u1eef li\u1ec7u trong y\u00eau c\u1ea7u',
+            });
+            expect(
+              await dataSource
+                .getRepository(ArticleFavorite)
+                .countBy({ userId: viewer.id }),
+            ).toBe(0);
+          },
+        );
+        it.each([false, true])(
+          'keeps omitted and empty request bodies valid (empty=%s)',
+          async (empty) => {
+            const article = await create();
+            const req = favorite(
+              method,
+              article.slug,
+              viewerAuthorization,
+            ).query({});
+            if (empty) req.send({});
+            await req.expect(200);
+          },
+        );
+      },
+    );
 
     it.each(['post', 'delete'] as const)(
       '%s requires a JWT, returns article 404 and rejects forged input',
