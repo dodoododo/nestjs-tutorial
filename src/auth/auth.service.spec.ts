@@ -5,6 +5,9 @@ import { getRepositoryToken } from '@nestjs/typeorm';
 import { compare, getRounds, hash } from 'bcrypt';
 import { I18nService } from 'nestjs-i18n';
 import { QueryFailedError } from 'typeorm';
+import { plainToInstance } from 'class-transformer';
+import { LoginDto } from './dto/login.dto';
+import { UpdateUserDto } from './dto/update-user.dto';
 
 import { User } from '../database/entities/user.entity';
 import { AuthService } from './auth.service';
@@ -26,6 +29,7 @@ describe('AuthService', () => {
     createQueryBuilder: jest.fn().mockReturnValue(queryBuilder),
     update: jest.fn(),
     findOne: jest.fn(),
+    manager: { transaction: jest.fn() },
   };
 
   const jwtService = {
@@ -42,6 +46,15 @@ describe('AuthService', () => {
     queryBuilder.getOne.mockReset();
     usersRepository.update.mockReset().mockResolvedValue({ affected: 1 });
     usersRepository.findOne.mockReset();
+    usersRepository.manager.transaction
+      .mockReset()
+      .mockImplementation(
+        async (
+          work: (manager: {
+            getRepository: () => typeof usersRepository;
+          }) => Promise<unknown>,
+        ) => work({ getRepository: () => usersRepository }),
+      );
     jwtService.signAsync.mockResolvedValue('signed-test-token');
     i18nService.t.mockReturnValue('Invalid email or password');
 
@@ -72,6 +85,7 @@ describe('AuthService', () => {
 
     const user = {
       id: 'user-uuid',
+      tokenVersion: 0,
       email: 'jacob@example.com',
       username: 'jacob',
       passwordHash,
@@ -81,10 +95,12 @@ describe('AuthService', () => {
 
     queryBuilder.getOne.mockResolvedValue(user);
 
-    const result = await service.login({
-      email: 'JACOB@example.com',
-      password,
-    });
+    const result = await service.login(
+      plainToInstance(LoginDto, {
+        email: '  JACOB@example.com  ',
+        password,
+      }),
+    );
 
     expect(result).toEqual({
       user: {
@@ -102,6 +118,7 @@ describe('AuthService', () => {
 
     expect(jwtService.signAsync).toHaveBeenCalledWith({
       sub: user.id,
+      tokenVersion: 0,
       jti: expect.any(String),
     });
   });
@@ -109,6 +126,7 @@ describe('AuthService', () => {
   describe('updateUser', () => {
     const user = {
       id: 'user-uuid',
+      tokenVersion: 0,
       email: 'jacob@example.com',
       username: 'jacob',
       bio: 'Original bio',
@@ -123,16 +141,16 @@ describe('AuthService', () => {
       i18nService.t.mockReturnValue('Email or username is already in use');
     });
 
-    it('updates allowed fields and hashes the password without issuing a JWT', async () => {
+    it('updates normalized fields and atomically rotates the JWT with a hashed password', async () => {
       const password = 'NewStrongPass123!';
       const result = await service.updateUser(
         user.id,
-        {
+        plainToInstance(UpdateUserDto, {
           username: '  updated_name  ',
           email: '  UPDATED@example.com  ',
           bio: null,
           password,
-        },
+        }),
         'existing-token',
       );
 
@@ -141,10 +159,13 @@ describe('AuthService', () => {
         email: 'updated@example.com',
         bio: null,
         passwordHash: expect.any(String),
+        tokenVersion: expect.any(Function),
       });
       const changes = usersRepository.update.mock.calls[0][1] as {
         passwordHash: string;
+        tokenVersion: () => string;
       };
+      expect(changes.tokenVersion()).toBe('token_version + 1');
       expect(await compare(password, changes.passwordHash)).toBe(true);
       expect(getRounds(changes.passwordHash)).toBe(BCRYPT_SALT_ROUNDS);
       expect(result).toEqual({
@@ -153,15 +174,60 @@ describe('AuthService', () => {
           username: user.username,
           bio: user.bio,
           image: user.image,
-          token: 'existing-token',
+          token: 'signed-test-token',
         },
       });
-      expect(jwtService.signAsync).not.toHaveBeenCalled();
+      expect(usersRepository.manager.transaction).toHaveBeenCalledTimes(1);
+      expect(jwtService.signAsync).toHaveBeenCalledWith({
+        sub: user.id,
+        tokenVersion: user.tokenVersion,
+        jti: expect.any(String),
+      });
       expect(usersRepository.findOne).toHaveBeenCalledWith({
         where: { id: user.id },
-        select: { email: true, username: true, bio: true, image: true },
+        select: {
+          id: true,
+          email: true,
+          username: true,
+          bio: true,
+          image: true,
+          tokenVersion: true,
+        },
       });
     });
+
+    it('propagates signing failure from inside the password transaction', async () => {
+      const failure = new Error('Signing unavailable');
+      jwtService.signAsync.mockRejectedValueOnce(failure);
+      await expect(
+        service.updateUser(
+          user.id,
+          { password: 'NewStrongPass123!' },
+          'old-token',
+        ),
+      ).rejects.toBe(failure);
+      const transaction = usersRepository.manager.transaction.mock.results[0]
+        .value as Promise<unknown>;
+      await expect(transaction).rejects.toBe(failure);
+    });
+
+    it.each(['username', 'email', 'bio'] as const)(
+      'does not rotate tokens for a %s-only update',
+      async (field) => {
+        const value = field === 'email' ? 'new@example.test' : 'changed';
+        const response = await service.updateUser(
+          user.id,
+          { [field]: value },
+          'existing-token',
+        );
+        expect(response.user.token).toBe('existing-token');
+        expect(usersRepository.update).toHaveBeenCalledWith(user.id, {
+          [field]: value,
+        });
+        expect(usersRepository.manager.transaction).not.toHaveBeenCalled();
+        expect(jwtService.signAsync).not.toHaveBeenCalled();
+      },
+    );
 
     it('writes only the supplied field and returns the latest stored values', async () => {
       usersRepository.findOne.mockResolvedValue({
@@ -260,6 +326,7 @@ describe('AuthService', () => {
 
     queryBuilder.getOne.mockResolvedValue({
       id: 'user-uuid',
+      tokenVersion: 0,
       email: 'jacob@example.com',
       username: 'jacob',
       passwordHash,
