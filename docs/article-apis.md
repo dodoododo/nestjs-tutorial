@@ -505,22 +505,27 @@ may specify the Docker executable when it is not on PATH. An optional Jest cache
 location can be passed as `-- --cacheDirectory=/path/to/cache`; filtering or
 skipping the required test through runner arguments is rejected.
 
-The tracked runner at `test/migrations/run-article-migration.cjs` creates a uniquely
-named and labelled disposable container. MySQL data lives only in tmpfs, without
+The tracked entry point `test/migrations/run-article-migration.cjs` delegates to
+`test/migrations/run-disposable-mysql.cjs`, shared with the separate Comments and
+Attachments commands. It creates a uniquely named and labelled disposable
+container. MySQL data lives only in tmpfs, without
 host mounts or persistent volumes. Its only published port is a dynamically
 allocated loopback port (32768–65535), separate from development port 3307 and
 ordinary test port 3308. It generates fresh credentials, uses the schema-scoped
 `article_migration_test` account, and supplies only the dedicated test target:
 `127.0.0.1:<allocated-port>/nestjs_article_migration_test`. Docker's image setup
 uses a separate random root password; neither tests nor migrations connect as
-root. Existing database servers and their schemas are never stopped or modified.
+root. The runner checks actual schema-only account grants, Docker tmpfs settings
+and the kernel `/proc/mounts` entry before allowing migrations. Existing database
+servers and their schemas are never stopped or modified.
 
 The dedicated Jest configuration selects exactly
 `test/migrations/article-migration.roundtrip.ts`. That filename is excluded by
 both ordinary E2E and unit discovery. The spec requires `NODE_ENV=test`, the
 runner's disposable-run marker, valid credentials and a permitted port. It
-ignores ordinary `DB_*` credentials, confirms the server UUID, database and
-account, and refuses a nonempty schema before running any migrations. It
+ignores ordinary `DB_*` credentials, confirms the server UUID, database, account
+and server hostname against the inspected container ID, and refuses a nonempty
+schema before running any migrations. It
 explicitly applies only the five PR4 migrations, including the later PR3
 token-version migration; future Comments migrations are outside this fixture.
 Guard failures, startup failures, migration failures and test failures produce

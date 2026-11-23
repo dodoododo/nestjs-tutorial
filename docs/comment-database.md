@@ -72,24 +72,110 @@ only `comments`, its primary key, two secondary indexes and two foreign keys.
 historical migrations are untouched. Both `synchronize` and `migrationsRun`
 remain `false`; normal application startup does not apply this migration.
 
-MySQL DDL can implicitly commit and cannot be protected by a complete
-transactional rollback. Migration checks use `transaction: 'none'`, verify actual
-schema and migration history, and restore pending migrations in `finally`.
-Reapplying a reverted migration recreates an empty table; it does not recover
-deleted comments. Re-running migrations with no pending migration is a no-op.
+MySQL DDL implicitly commits; a transaction cannot safely undo a failed
+roundtrip. Destructive Comments, Attachments and Article migration tests therefore
+run separately from ordinary E2E, each in a newly created disposable database.
+Normal E2E never reverts migrations or drops tables. The Comments and Attachments
+database suites require an already migrated schema and reject pending migrations.
+They retain read-only schema/index/foreign-key checks and normal fixture writes.
 
-The database E2E suite first verifies `NODE_ENV=test`, MySQL at
-`127.0.0.1:3308/nestjs_tutorial_test`, Redis at `127.0.0.1:6380`, and disabled schema
-synchronization/automatic migrations, before fixture writes or DDL. Historical
-migrations must already be applied. The focused Comment suite can apply only the
-new Comments migration and refuses any other pending migration.
+### Reproduce from a fresh checkout
 
-Run on Node.js 26.13.0:
+Use Node.js **26.13.0** and a running Docker daemon with permission to create
+containers. Install the locked dependencies, then run each dedicated command:
+
+```powershell
+npm.cmd ci
+npm.cmd run test:migration:articles
+npm.cmd run test:migration:comments
+npm.cmd run test:migration:attachments
+```
+
+No `.env.test`, Redis, pre-existing database, ignored helper or administrator SQL
+account is required. The runner uses existing project dependencies and the
+`mysql:8.4` image (Docker pulls it if necessary). `DOCKER_BIN` can select the Docker
+executable. Each command accepts only an optional Jest cache argument, for example
+`-- --cacheDirectory=D:\nestjs-jest-cache`; test filtering/skipping is rejected.
+Dedicated Jest configurations select exactly one `*.roundtrip.ts` file each;
+ordinary E2E and unit discovery exclude those filenames. A normal E2E pass does
+not mean a migration roundtrip executed: run and report these commands separately.
+
+The three small `run-*-migration.cjs` entry points share
+`test/migrations/run-disposable-mysql.cjs`. It creates a uniquely named and
+labelled container per invocation with independent random application and root
+passwords. Tests connect only as the non-root, schema-scoped account; the runner
+checks its actual grants. The dedicated schemas are
+`nestjs_article_migration_test`, `nestjs_comment_migration_test` and
+`nestjs_attachment_migration_test`.
+
+MySQL storage is tmpfs only: the runner checks Docker's `HostConfig.Tmpfs`, rejects
+host binds/persistent mounts, and verifies `/var/lib/mysql` in `/proc/mounts` using
+non-root `docker exec`. The sole published port binds to `127.0.0.1` and is
+dynamically allocated in 32768–65535, separate from development 3307 and ordinary
+E2E 3308. Before any migration, the runner and test verify database/account,
+server UUID and server hostname against the inspected container ID. Tests also
+require `NODE_ENV=test`, the invocation marker, a permitted port and generated
+credentials. Dedicated target guards ignore ordinary `DB_*` settings and provide
+no fallback. A nonempty disposable schema, identity mismatch, missing guard,
+Docker/startup failure or failed assertion exits nonzero without skipping tests.
+
+### Migration history and retained assertions
+
+The Comments fixture explicitly applies the five PR4 prerequisite migrations
+using the test database's `migrations` ledger. This includes PR3's
+`AddUserTokenVersion`, whose timestamp is newer than Comments. A second test-only
+DataSource registers **only** `CreateComments1795251668000` and uses the separate
+`comment_migrations` ledger. TypeORM's public `undoLastMigration` and
+`runMigrations` APIs can therefore revert/reapply only Comments. DOWN empties that
+selected ledger; UP restores the name/timestamp with a new history ID. The
+prerequisite ledger, including every original ID, remains unchanged. Production
+migration registration, ordering and implementations are untouched.
+
+Attachments uses the same approach with `attachment_migrations`, retaining newer
+PR3/Article prerequisites. Article retains its existing selected down/up and
+unchanged-history assertions in its PR4-only fixture. All use
+`transaction: 'none'`. Empty target tables and absence of inbound foreign keys
+remain required before destructive DDL. Recreated tables are empty; UP does not
+recover deleted records.
+
+Comments checks full columns, primary/secondary indexes and both foreign keys
+before and after DOWN/UP. It verifies that only Comments disappears/reappears,
+hashes earlier rows and `SHOW CREATE TABLE` definitions for users, follows,
+attachments, articles, tags and favorites, and preserves prerequisite history.
+Migration reruns are no-ops. New Comment inserts, rejected invalid parents,
+`ON UPDATE RESTRICT` and both `ON DELETE CASCADE` paths execute after recreation.
+Attachments retains equivalent schema/history/earlier-row checks and a new write
+with a BIGINT file size beyond JavaScript's safe integer range.
+
+### Cleanup and ordinary E2E
+
+The runner removes only its own container in `finally`, rechecking exact name,
+invocation label and container ID. This includes Jest failure and SIGINT/SIGTERM.
+Partial DDL needs no shared-schema repair: the entire owned container is removed.
+A hard process kill or daemon failure can prevent cleanup. In that case inspect
+the exact name/ID printed by the runner:
+
+```powershell
+docker inspect <exact-container-name>
+```
+
+Verify the inspected ID starts with the printed ID prefix. The matching
+`nestjs.article-migration-run`, `nestjs.comment-migration-run` or
+`nestjs.attachment-migration-run` label must equal the 32-hex suffix of the printed
+container name. Only then run `docker rm --force <exact-container-ID>`.
+Never prune unrelated containers or volumes.
+
+Ordinary E2E requires the existing migrated MySQL test schema at
+`127.0.0.1:3308/nestjs_tutorial_test`, Redis at `127.0.0.1:6380`, `.env.test` and
+`NODE_ENV=test`. Existing guards reject other targets and enabled schema
+synchronization/automatic migrations before fixture writes. Keep normal suites
+serial for shared fixture isolation. With those dedicated test services prepared:
 
 ```powershell
 npm.cmd run test:e2e -- --runInBand comment-database.e2e-spec.ts
 npm.cmd run test:e2e -- --runInBand article-database.e2e-spec.ts
-npm.cmd run format
+npm.cmd exec -- tsc --noEmit -p tsconfig.json
+npm.cmd exec -- tsc --noEmit -p tsconfig.build.json
 npm.cmd run lint
 npm.cmd run build
 npm.cmd test -- --runInBand
@@ -97,14 +183,9 @@ npm.cmd run test:e2e -- --runInBand
 git diff --check
 ```
 
-Migration roundtrips refuse to drop nonempty target tables. The Comment suite
-compares hashed snapshots of existing PR2/PR3/PR4 rows and schemas before and
-after rollback/reapply, including fixtures for users, follows, attachments,
-articles, tags and favorites. Cleanup targets only test-created records. The
-existing Article migration test now reverts the dependent, empty Comments table
-before reverting Articles, then restores both migrations. Run these suites
-serially because their migration checks change the isolated schema. Never run
-destructive verification against development or production databases.
+Normal test cleanup deletes only test-created records. Downstream foreign keys
+remain installed throughout normal E2E; no historical migration is reverted.
+Never run destructive verification against development or production databases.
 
 ## Later service requirements
 

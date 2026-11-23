@@ -1,19 +1,18 @@
 import { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import Redis from 'ioredis';
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { DataSource, In, Repository } from 'typeorm';
 import { AppModule } from '../src/app.module';
 import { INVALID_USER_PASSWORD_HASH } from '../src/auth/constants/auth.constant';
 import { Article } from '../src/database/entities/article.entity';
 import { ArticleFavorite } from '../src/database/entities/article-favorite.entity';
 import { ArticleTag } from '../src/database/entities/article-tag.entity';
-import { Attachment } from '../src/database/entities/attachment.entity';
 import { Comment } from '../src/database/entities/comment.entity';
-import { Follow } from '../src/database/entities/follow.entity';
 import { Tag } from '../src/database/entities/tag.entity';
 import { User } from '../src/database/entities/user.entity';
 import { REDIS_CLIENT } from '../src/redis/redis.constant';
+import { expectCommentSchema } from './helpers/expect-comment-schema';
 
 describe('Comment foundation (database e2e)', () => {
   const migrationName = 'CreateComments1795251668000';
@@ -30,7 +29,6 @@ describe('Comment foundation (database e2e)', () => {
   let unrelated: Article;
   const userIds: string[] = [];
   const tagIds: string[] = [];
-  const attachmentIds: string[] = [];
 
   function values(overrides: Partial<Comment> = {}) {
     return {
@@ -75,28 +73,11 @@ describe('Comment foundation (database e2e)', () => {
       'SELECT @@SESSION.sql_mode AS mode',
     )) as { mode: string }[];
     expect(mode).toMatch(/STRICT_TRANS_TABLES|STRICT_ALL_TABLES/);
-    const executed = new Set(
-      (await history()).map((migration) => migration.name),
-    );
-    const pending = dataSource.migrations.filter(
-      (migration) =>
-        !executed.has(migration.name ?? migration.constructor.name),
-    );
-    if (
-      pending.some(
-        (migration) =>
-          (migration.name ?? migration.constructor.name) !== migrationName,
-      )
-    ) {
+    // This suite never changes schema/history. Provision normal E2E migrations first.
+    if (await dataSource.showMigrations())
       throw new Error(
-        'Apply historical migrations to the isolated test database first',
+        'Apply migrations to the guarded E2E database before testing',
       );
-    }
-    // This suite can set up only its new migration; never repair/reset old data.
-    const applied = await dataSource.runMigrations({ transaction: 'none' });
-    expect(applied.map((migration) => migration.name)).toEqual(
-      pending.length ? [migrationName] : [],
-    );
     comments = dataSource.getRepository(Comment);
     users = dataSource.getRepository(User);
     articles = dataSource.getRepository(Article);
@@ -136,10 +117,6 @@ describe('Comment foundation (database e2e)', () => {
     if (userIds.length) await users.delete({ id: In(userIds.splice(0)) });
     if (tagIds.length)
       await dataSource.getRepository(Tag).delete({ id: In(tagIds.splice(0)) });
-    if (attachmentIds.length)
-      await dataSource
-        .getRepository(Attachment)
-        .delete({ id: In(attachmentIds.splice(0)) });
   });
   afterAll(async () => {
     await app?.close();
@@ -147,131 +124,10 @@ describe('Comment foundation (database e2e)', () => {
 
   it('matches entity columns, indexes and foreign keys to the applied schema', async () => {
     expect(await dataSource.showMigrations()).toBe(false);
-    expect((await history()).at(-1)?.name).toBe(migrationName);
-    const runner = dataSource.createQueryRunner();
-    try {
-      const table = (await runner.getTable('comments'))!;
-      const metadata = dataSource.getMetadata(Comment);
-      expect(table).toBeDefined();
-      const columns = [
-        'id',
-        'article_id',
-        'author_id',
-        'body',
-        'created_at',
-        'updated_at',
-      ];
-      expect(table.columns.map((column) => column.name).sort()).toEqual(
-        [...columns].sort(),
-      );
-      expect(
-        metadata.columns.map((column) => column.databaseName).sort(),
-      ).toEqual([...columns].sort());
-      expect(table.columns.every((column) => !column.isNullable)).toBe(true);
-      expect(table.primaryColumns.map((column) => column.name)).toEqual(['id']);
-      expect(
-        metadata.primaryColumns.map((column) => column.databaseName),
-      ).toEqual(['id']);
-      expect(
-        metadata.generatedColumns.map((column) => [
-          column.databaseName,
-          column.generationStrategy,
-        ]),
-      ).toEqual([['id', 'uuid']]);
-      for (const name of ['id', 'article_id', 'author_id'])
-        expect(table.findColumnByName(name)).toMatchObject({
-          type: 'varchar',
-          length: '36',
-          isNullable: false,
-        });
-      expect(table.findColumnByName('body')).toMatchObject({
-        type: 'text',
-        isNullable: false,
-      });
-      for (const name of ['created_at', 'updated_at']) {
-        const column = table.findColumnByName(name)!;
-        expect(column).toMatchObject({
-          type: 'datetime',
-          precision: 3,
-          isNullable: false,
-        });
-        expect(String(column.default).toUpperCase()).toContain(
-          'CURRENT_TIMESTAMP(3)',
-        );
-      }
-      expect(
-        table.findColumnByName('updated_at')!.onUpdate?.toUpperCase(),
-      ).toBe('CURRENT_TIMESTAMP(3)');
-      const expectedIndexes = [
-        {
-          name: 'IDX_comments_article_created_at_id',
-          columnNames: ['article_id', 'created_at', 'id'],
-          isUnique: false,
-        },
-        {
-          name: 'IDX_comments_author_id',
-          columnNames: ['author_id'],
-          isUnique: false,
-        },
-      ];
-      expect(table.indices).toHaveLength(expectedIndexes.length);
-      for (const index of expectedIndexes) {
-        expect(table.indices).toContainEqual(expect.objectContaining(index));
-        expect(
-          metadata.indices.map((entry) => ({
-            name: entry.name,
-            columnNames: entry.columns.map((column) => column.databaseName),
-            isUnique: entry.isUnique,
-          })),
-        ).toContainEqual(index);
-      }
-      expect(table.foreignKeys).toHaveLength(2);
-      for (const [column, parent] of [
-        ['article_id', 'articles'],
-        ['author_id', 'users'],
-      ]) {
-        expect(table.foreignKeys).toContainEqual(
-          expect.objectContaining({
-            name: `FK_comments_${column}`,
-            columnNames: [column],
-            referencedTableName: parent,
-            referencedColumnNames: ['id'],
-            onDelete: 'CASCADE',
-            onUpdate: 'RESTRICT',
-          }),
-        );
-      }
-      expect(
-        metadata.relations.map((relation) => relation.propertyName).sort(),
-      ).toEqual(['article', 'author']);
-      for (const relation of metadata.relations) {
-        expect(relation.relationType).toBe('many-to-one');
-        expect(relation.isEager).toBe(false);
-        expect(relation.isCascadeInsert).toBe(false);
-        expect(relation.isCascadeUpdate).toBe(false);
-        expect(relation.isCascadeRemove).toBe(false);
-      }
-      const articleTable = (await runner.getTable('articles'))!;
-      expect(
-        articleTable.columns.some((column) => /comment/i.test(column.name)),
-      ).toBe(false);
-      expect(
-        dataSource
-          .getMetadata(Article)
-          .relations.some(
-            (relation) => relation.inverseEntityMetadata.target === Comment,
-          ),
-      ).toBe(false);
-      expect(
-        dataSource
-          .getMetadata(User)
-          .relations.some(
-            (relation) => relation.inverseEntityMetadata.target === Comment,
-          ),
-      ).toBe(false);
-    } finally {
-      await runner.release();
-    }
+    expect((await history()).map((migration) => migration.name)).toContain(
+      migrationName,
+    );
+    await expectCommentSchema(dataSource);
   });
 
   it('generates a UUID and timestamps, preserves formatting and loads both parent relations explicitly', async () => {
@@ -566,98 +422,4 @@ describe('Comment foundation (database e2e)', () => {
       });
     },
   );
-
-  it('reverts, reapplies and repeats Comments migration without changing PR2/PR3/PR4 rows or schemas', async () => {
-    if ((await comments.count()) !== 0)
-      throw new Error(
-        'Refusing Comments migration roundtrip: comments is nonempty',
-      );
-    const tag = await dataSource
-      .getRepository(Tag)
-      .save({ name: `comment_${randomUUID()}` });
-    tagIds.push(tag.id);
-    await dataSource
-      .getRepository(ArticleTag)
-      .insert({ articleId: article.id, tagId: tag.id });
-    await dataSource
-      .getRepository(ArticleFavorite)
-      .insert({ articleId: article.id, userId: viewer.id });
-    await dataSource
-      .getRepository(Follow)
-      .insert({ followerId: viewer.id, followingId: owner.id });
-    const attachmentId = randomUUID();
-    attachmentIds.push(attachmentId);
-    await dataSource
-      .getRepository(Attachment)
-      .insert({
-        id: attachmentId,
-        attachableType: 'user',
-        attachableId: owner.id,
-        url: '/existing-avatar.png',
-        fileName: 'existing-avatar.png',
-        fileType: 'image/png',
-        fileSize: '9007199254740993',
-      });
-    const previous = [
-      ['users', 'id'],
-      ['follows', 'id'],
-      ['attachments', 'id'],
-      ['articles', 'id'],
-      ['tags', 'id'],
-      ['article_tags', 'article_id, tag_id'],
-      ['article_favorites', 'user_id, article_id'],
-    ];
-    const digest = (value: unknown) =>
-      createHash('sha256').update(JSON.stringify(value)).digest('hex');
-    const snapshot = async () => {
-      const result: Record<string, { rows: string; schema: string }> = {};
-      for (const [table, order] of previous)
-        result[table] = {
-          rows: digest(
-            await dataSource.query(`SELECT * FROM ${table} ORDER BY ${order}`),
-          ),
-          schema: digest(await dataSource.query(`SHOW CREATE TABLE ${table}`)),
-        };
-      return result;
-    };
-    const before = await snapshot();
-    const beforeHistory = await history();
-    expect(beforeHistory.at(-1)?.name).toBe(migrationName);
-    const runner = dataSource.createQueryRunner();
-    try {
-      await dataSource.undoLastMigration({ transaction: 'none' });
-      expect(await runner.hasTable('comments')).toBe(false);
-      expect(await snapshot()).toEqual(before);
-      expect(await history()).toEqual(beforeHistory.slice(0, -1));
-      const applied = await dataSource.runMigrations({ transaction: 'none' });
-      expect(applied.map((migration) => migration.name)).toEqual([
-        migrationName,
-      ]);
-      expect(await runner.hasTable('comments')).toBe(true);
-      expect(await snapshot()).toEqual(before);
-      const afterHistory = await history();
-      expect(afterHistory.slice(0, -1)).toEqual(beforeHistory.slice(0, -1));
-      expect(afterHistory.at(-1)).toMatchObject({
-        name: migrationName,
-        timestamp: beforeHistory.at(-1)!.timestamp,
-      });
-      expect(await dataSource.runMigrations({ transaction: 'none' })).toEqual(
-        [],
-      );
-      expect(await history()).toEqual(afterHistory);
-      expect(await dataSource.showMigrations()).toBe(false);
-      const saved = await comments.save(values());
-      expect(await comments.findOneByOrFail({ id: saved.id })).toMatchObject({
-        body: saved.body,
-        authorId: viewer.id,
-        articleId: article.id,
-      });
-    } finally {
-      try {
-        await dataSource.runMigrations({ transaction: 'none' });
-      } finally {
-        await runner.release();
-      }
-    }
-  }, 30_000);
 });

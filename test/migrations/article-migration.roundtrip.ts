@@ -45,7 +45,8 @@ describe('Article migration (disposable MySQL only)', () => {
   }
 
   beforeAll(async () => {
-    const { serverUuid, ...connection } = articleMigrationTarget(process.env);
+    const { serverUuid, serverHostname, ...connection } =
+      articleMigrationTarget(process.env);
     dataSource = new DataSource({
       ...connection,
       type: 'mysql',
@@ -75,10 +76,16 @@ describe('Article migration (disposable MySQL only)', () => {
     await dataSource.initialize();
     // Identity and emptiness are checked before migrations or fixture writes.
     const [identity] = (await dataSource.query(
-      'SELECT @@server_uuid AS serverUuid, DATABASE() AS db, CURRENT_USER() AS account',
-    )) as { serverUuid: string; db: string; account: string }[];
+      'SELECT @@server_uuid AS serverUuid, @@hostname AS hostname, DATABASE() AS db, CURRENT_USER() AS account',
+    )) as {
+      serverUuid: string;
+      hostname: string;
+      db: string;
+      account: string;
+    }[];
     expect(identity).toEqual({
       serverUuid,
+      hostname: serverHostname,
       db: 'nestjs_article_migration_test',
       account: 'article_migration_test@%',
     });

@@ -7,6 +7,7 @@ describe('Disposable Article migration target guards', () => {
     ARTICLE_MIGRATION_DB_PORT: '49152',
     ARTICLE_MIGRATION_DB_PASSWORD: 'b'.repeat(64),
     ARTICLE_MIGRATION_SERVER_UUID: '12345678-1234-1234-1234-123456789abc',
+    ARTICLE_MIGRATION_CONTAINER_ID: 'c'.repeat(64),
   };
 
   it.each([
@@ -20,6 +21,7 @@ describe('Disposable Article migration target guards', () => {
     ['ARTICLE_MIGRATION_DB_PORT', undefined],
     ['ARTICLE_MIGRATION_DB_PASSWORD', undefined],
     ['ARTICLE_MIGRATION_SERVER_UUID', undefined],
+    ['ARTICLE_MIGRATION_CONTAINER_ID', undefined],
   ])('refuses %s=%s before connecting', (key, value) => {
     expect(() => articleMigrationTarget({ ...valid, [key!]: value })).toThrow(
       'Unsafe migration target',
