@@ -35,6 +35,53 @@ Select the validated version before installing dependencies or running checks.
 $ npm install
 ```
 
+## User and profile API behavior
+
+Authentication HTTP input is normalized in DTO transformations before validation:
+usernames are trimmed, and emails are trimmed and lowercased for registration,
+login, and updates. Direct AuthService callers must supply validated, normalized
+DTO input. Passwords and bio whitespace are preserved.
+
+New passwords require 8–72 characters and at most 72 UTF-8 bytes; login keeps its
+existing nonempty minimum. Usernames require 3–50 characters, emails at most 254
+characters, and bio at most 65535 UTF-8 bytes. Omitted update fields are preserved;
+only bio accepts null to clear it.
+
+`PUT /api/users` returns the same User response shape. A successful password
+change now returns a **fresh `user.token`** and invalidates all previously issued
+JWTs for that account. Clients must replace their stored token. Username, email,
+bio, and empty updates retain the existing token. Duplicate account fields still
+return 409, and validation errors return 400.
+
+Apply the new `AddUserTokenVersion1795402800000` migration before deploying the
+updated application. It adds unsigned, non-null `users.token_version`, default 0;
+historical migrations are unchanged. New JWTs include a numeric `tokenVersion`.
+Legacy JWTs without the claim are interpreted as version 0 and remain valid only
+until the first password change. Negative, noninteger, unsafe, nonnumeric, null,
+and mismatched claims are rejected with 401. The Redis JTI blacklist still handles
+logout, and Redis failures still fail closed with 503.
+
+Password hashing uses bcrypt with the existing cost. The hash update and atomic
+version increment occur in one transaction. The response JWT is signed while
+that transaction holds the row lock, using its own version. Signing or database
+failure rolls back the change. Concurrent successful password changes get distinct
+versions; only the latest version authenticates after both complete. Requests
+already authenticated before a password change can finish. Reverting the migration
+is for isolated testing only: removing version history can revive legacy sessions.
+
+Both `POST /api/profiles/:username/follow` and
+`DELETE /api/profiles/:username/follow` are idempotent: repeated requests return
+200 with `following: true` or `following: false`, respectively. Concurrent follows
+create one directed relationship using the existing unique index. Only a duplicate
+error for that exact index is treated as success. Self-follow remains 400, missing
+targets 404, and missing or invalid credentials 401. Public Profile fields remain
+username, bio, image, and following.
+
+When propagating this fix to stacked PR4, PR5, and PR6, retain their own migrations
+and tests, apply the token-version migration in timestamp order, and update any
+expectations for password rotation or duplicate-follow 409 responses. PR6 C2 tests
+must be revisited downstream; they are not present on this branch.
+
 ## Compile and run the project
 
 ```bash

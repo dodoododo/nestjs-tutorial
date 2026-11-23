@@ -81,7 +81,7 @@ export class AuthController {
   @ApiOperation({
     summary: 'Update current authenticated user',
     description:
-      'Updates only supplied fields. An empty user object is a no-op. Bio may be null to clear it. Returns the existing JWT.',
+      'Updates only supplied fields. An empty user object is a no-op. Bio may be null to clear it. Password changes return a fresh JWT and invalidate all earlier JWTs. Other updates return the existing JWT.',
   })
   @ApiOkResponse({ type: UserResponseDto })
   @ApiBadRequestResponse({ description: 'Invalid or unknown update fields' })

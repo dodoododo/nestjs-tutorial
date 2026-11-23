@@ -22,6 +22,7 @@ import { UpdateUserDto } from './dto/update-user.dto';
 import { UserResponseDto } from './dto/user-response.dto';
 
 @Injectable()
+// HTTP callers supply DTO-transformed, validated input; direct callers must do the same.
 export class AuthService {
   constructor(
     @InjectRepository(User)
@@ -34,8 +35,8 @@ export class AuthService {
     const passwordHash = await hash(dto.password, BCRYPT_SALT_ROUNDS);
 
     const user = this.usersRepository.create({
-      username: dto.username.trim(),
-      email: dto.email.toLowerCase(),
+      username: dto.username,
+      email: dto.email,
       passwordHash,
       bio: null,
       image: null,
@@ -59,12 +60,10 @@ export class AuthService {
   }
 
   async login(dto: LoginDto): Promise<UserResponseDto> {
-    const email = dto.email.trim().toLowerCase();
-
     const user = await this.usersRepository
       .createQueryBuilder('user')
       .addSelect('user.passwordHash')
-      .where('user.email = :email', { email })
+      .where('user.email = :email', { email: dto.email })
       .getOne();
 
     const passwordHash = user?.passwordHash ?? INVALID_USER_PASSWORD_HASH;
@@ -88,10 +87,10 @@ export class AuthService {
     > = {};
 
     if (dto.username !== undefined) {
-      changes.username = dto.username.trim();
+      changes.username = dto.username;
     }
     if (dto.email !== undefined) {
-      changes.email = dto.email.trim().toLowerCase();
+      changes.email = dto.email;
     }
     if (dto.bio !== undefined) {
       changes.bio = dto.bio;
@@ -100,37 +99,62 @@ export class AuthService {
       changes.passwordHash = await hash(dto.password, BCRYPT_SALT_ROUNDS);
     }
 
-    if (Object.keys(changes).length > 0) {
-      try {
-        // Update only supplied columns, without saving a stale principal entity.
-        const result = await this.usersRepository.update(userId, changes);
+    const persist = async (
+      repository: Repository<User>,
+    ): Promise<UserResponseDto> => {
+      if (Object.keys(changes).length > 0) {
+        // One UPDATE changes the hash and increments the version under the same row lock.
+        const result = await repository.update(userId, {
+          ...changes,
+          ...(dto.password !== undefined
+            ? { tokenVersion: () => 'token_version + 1' }
+            : {}),
+        });
         if (result.affected === 0) {
           throw new UnauthorizedException();
         }
-      } catch (error: unknown) {
-        if (
-          error instanceof QueryFailedError &&
-          (error.driverError as { code?: string }).code ===
-            MYSQL_DUPLICATE_ENTRY_CODE
-        ) {
-          throw new ConflictException(
-            this.i18n.t('auth.ACCOUNT_UPDATE_CONFLICT'),
-          );
-        }
-        throw error;
       }
+
+      const user = await repository.findOne({
+        where: { id: userId },
+        select: {
+          id: true,
+          email: true,
+          username: true,
+          bio: true,
+          image: true,
+          tokenVersion: true,
+        },
+      });
+      if (!user) {
+        throw new UnauthorizedException();
+      }
+
+      return dto.password !== undefined
+        ? this.createUserResponse(user)
+        : this.getCurrentUser(user, token);
+    };
+
+    try {
+      // Keep the row lock through reading/signing: a concurrent password change
+      // must never lend its newer version to this request's JWT. Signing failure rolls back.
+      return await (dto.password !== undefined
+        ? this.usersRepository.manager.transaction((manager) =>
+            persist(manager.getRepository(User)),
+          )
+        : persist(this.usersRepository));
+    } catch (error: unknown) {
+      if (
+        error instanceof QueryFailedError &&
+        (error.driverError as { code?: string }).code ===
+          MYSQL_DUPLICATE_ENTRY_CODE
+      ) {
+        throw new ConflictException(
+          this.i18n.t('auth.ACCOUNT_UPDATE_CONFLICT'),
+        );
+      }
+      throw error;
     }
-
-    const user = await this.usersRepository.findOne({
-      where: { id: userId },
-      select: { email: true, username: true, bio: true, image: true },
-    });
-
-    if (!user) {
-      throw new UnauthorizedException();
-    }
-
-    return this.getCurrentUser(user, token);
   }
 
   getCurrentUser(user: User, token: string): UserResponseDto {
@@ -148,6 +172,7 @@ export class AuthService {
   private async createUserResponse(user: User): Promise<UserResponseDto> {
     const token = await this.jwtService.signAsync({
       sub: user.id,
+      tokenVersion: user.tokenVersion,
       jti: randomUUID(),
     });
 

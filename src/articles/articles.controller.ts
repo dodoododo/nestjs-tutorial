@@ -62,13 +62,18 @@ export class ArticlesController {
     }),
   )
   @ApiBearerAuth()
-  @ApiOperation({ summary: 'Create an article' })
+  @ApiOperation({
+    summary: 'Create an article',
+    description:
+      'Generates a readable slug with a random suffix. Duplicate titles and Feed titles are allowed.',
+  })
   @ApiCreatedResponse({ type: ArticleResponseDto })
   @ApiBadRequestResponse({
-    description: 'Invalid article input, unknown fields or reserved feed slug',
+    description: 'Invalid article input or unknown fields',
   })
   @ApiConflictResponse({
-    description: 'An equivalent article slug already exists',
+    description:
+      'Unable to allocate a unique slug after bounded retries; retry the request',
   })
   create(
     @Body() body: CreateArticleRequestDto,
@@ -214,18 +219,19 @@ export class ArticlesController {
   @ApiOperation({
     summary: 'Update an article owned by the current user',
     description:
-      'Omitted fields are preserved. An empty article object is a no-op. Changing the title regenerates the slug; the slug feed is reserved. Tag updates are not accepted.',
+      'Omitted fields are preserved. An empty article object is a no-op. Changing the title generates a new slug with a random suffix; unchanged titles retain their slug. Feed titles are supported. Tag updates are not accepted.',
   })
   @ApiOkResponse({ type: ArticleResponseDto })
   @ApiBadRequestResponse({
-    description: 'Invalid article input, unknown fields or reserved feed slug',
+    description: 'Invalid article input or unknown fields',
   })
   @ApiForbiddenResponse({
     description: 'Only the article author may update it',
   })
   @ApiNotFoundResponse({ description: 'Article not found' })
   @ApiConflictResponse({
-    description: 'An equivalent article slug already exists',
+    description:
+      'Unable to allocate a unique slug after bounded retries; retry the request',
   })
   update(
     @Param('slug') slug: string,
