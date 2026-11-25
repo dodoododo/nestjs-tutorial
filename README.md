@@ -77,10 +77,12 @@ error for that exact index is treated as success. Self-follow remains 400, missi
 targets 404, and missing or invalid credentials 401. Public Profile fields remain
 username, bio, image, and following.
 
-When propagating this fix to stacked PR4, PR5, and PR6, retain their own migrations
-and tests, apply the token-version migration in timestamp order, and update any
-expectations for password rotation or duplicate-follow 409 responses. PR6 C2 tests
-must be revisited downstream; they are not present on this branch.
+The PR6 C2 suites now exercise these merged behaviors, including duplicate Follow
+success, legacy JWT compatibility, malformed token versions and stale sessions.
+Run `npm run test:c2:setup` after merging migrations, then `npm run test:c2`.
+Both suites share guarded lifecycle hooks and discover application tables from
+the dedicated C2 schema. See [C2 lifecycle](docs/c2-test-lifecycle.md) and
+[condition coverage](docs/c2-profiles-coverage.md) for isolation and verification.
 
 ## Compile and run the project
 

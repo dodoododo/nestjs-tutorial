@@ -1,4 +1,4 @@
-﻿# ProfilesController C2 condition coverage
+# ProfilesController C2 condition coverage
 
 ## Definition and scope
 
@@ -41,13 +41,17 @@ source/function, both witnesses and observable evidence.
   T F02/F03 (400, no insert, including case-insensitive username lookup),
   F F01 (200, exactly one actor-target insert).
 - **C-P05**: `profiles.service.ts/follow` catch,
-  `error instanceof QueryFailedError`: T F05/F08, F F09. F05 observes the real
-  duplicate constraint (409); F08 directly observes a nonduplicate
+  `error instanceof QueryFailedError`: T F05/F08/F10, F F09. F05 observes the real
+  duplicate constraint (200, idempotent); F08 directly observes a nonduplicate
   QueryFailedError (500); F09 directly observes the connection-acquisition error
   class (500). All failed requests preserve persisted state.
 - **C-P06**: same catch, `driverError.code === MYSQL_DUPLICATE_ENTRY_CODE`:
-  T F05 (409), F F08 (500 and observed nonduplicate driver code).
+  T F05/F10 (200/500), F F08 (500 and observed nonduplicate driver code).
   Evaluated only when C-P05 is T.
+- **C-P07**: exact relationship unique-index match: T F05 (idempotent 200),
+  F F10 (different real unique index, sanitized 500). The temporary index is
+  created and removed under the verified C2 lease. Real mysql2 errors supply
+  `sqlMessage`; its nullish fallback is not fabricated with mocked SQL results.
 - **C-G01**: `optional-jwt-auth.guard.ts/canActivate`,
   `authorization === undefined`: T G01/G08 (200 without Redis GET), F G02 and
   GET credential-negative cases (200 with valid credentials, otherwise 401/503).
@@ -69,6 +73,12 @@ source/function, both witnesses and observable evidence.
   Passport requires the same extractor to return a token before calling validate;
   nothing between the extractions mutates Authorization. No request/guard mock
   manufactures this outcome.
+- **C-J07**: token version supplied: T normal tokens, F V01/V02.
+- **C-J08**: version not a safe integer: T J06-J09, F F01/J05.
+- **C-J09**: negative integer version: T J05, F F01.
+- **C-J10**: persisted/token version mismatch: T V02/V03, F V01/V04.
+  Deleted-user cases short-circuit the comparison. V01/V02 select the legacy
+  nullish fallback; V03/V04 select the supplied version.
 - **C-R01**: `redis.service.ts/assertReady`, `status !== 'ready'`:
   T all `A-*-redis-disconnected` cases (actual client end event, 503), F normal
   credentials and `A-*-redis-get-outage` cases (ready client).
@@ -94,9 +104,10 @@ statement/branch counters below provide independent structural evidence.
 - JWT claims use `C-J01 || C-J02 || C-J03`: supplied combinations TFF, FTF,
   FFT, FFF map to J01, J02, J03/J04, F01. Evaluated vectors are T--, FT-, FFT,
   FFF. Each isolated invalid claim changes the decision from the valid baseline.
-- Follow catch uses `C-P05 && C-P06`: TT is a real duplicate constraint,
-  F05 -> 409; TF is a closed MySQL request connection, F08 -> sanitized 500;
-  F- is failed connection acquisition, F09 -> sanitized 500. FT is not an
+- Follow catch uses `C-P05 && C-P06 && C-P07`: TTT is the real relationship
+  duplicate, F05 -> idempotent 200; TTF is a different unique index, F10 -> 500;
+  TF- is a closed MySQL request connection, F08 -> sanitized 500;
+  F-- is failed connection acquisition, F09 -> sanitized 500. FT- is not an
   evaluated combination under short-circuit AND. F08 calls the real mysql2
   connection's destroy method immediately before the real INSERT; F09 injects
   acquisition unavailability. Neither fabricates a database result.
@@ -107,196 +118,140 @@ statement/branch counters below provide independent structural evidence.
   self checks or writes. FK/unique constraints remain real. No bypassed guard or
   invalid database fixture is used to claim unreachable combinations.
 
-Assessment: **14 feasible source condition sites have T/F witnesses**, and all
-their feasible decision outcomes are covered. The fifteenth site, C-J06, has only
-its feasible F outcome. B01/B02 and E01 are also exercised. This is a scoped
-condition/decision assessment, not universal 100% C2 or 100% Jest branch coverage.
+Assessment: **19 feasible source condition sites have T/F witnesses**. C-J06 has
+only its feasible F outcome. The nested version predicate is isolated with absent,
+valid, noninteger and negative versions. This scoped assessment does not claim
+universal 100% C2 or 100% Jest branch coverage.
 
-## Passing test catalogue and assertions
+## Compatibility and case catalogue
 
-There are **52 new cases**: G01-G08 (8), F01-F09 (9), U01-U05 (5),
-26 authentication cases and J01-J04 (4).
+Merged main makes Follow idempotent and adds persisted token versions. F05 now
+asserts 200, the exact successful body and unchanged state; F06 asserts [200, 200],
+both exact bodies and one directed edge. F10 ensures other duplicate constraints
+still propagate as sanitized 500 without mutation. Fixture JWTs sign the persisted
+version, and snapshots hash that column along with private/public User columns.
+Shared bootstrap uses `configureHttpApplication()`. No production code or migration
+source was changed. `test:c2:setup` applied the pending `AddUserTokenVersion` migration.
 
-- **G01** anonymous existing profile, 200/false even with a stored relation.
-- **G02** authenticated actor follows target, 200/true.
-- **G03** authenticated actor does not follow target, 200/false.
-- **G04** reverse/unrelated edges only, 200/false.
-- **G05/G06** anonymous/authenticated unknown target, 404.
-- **G07** null bio/image, 200 with nulls preserved; other G cases cover non-null.
-- **G08** anonymous request during Redis GET outage, 200/false, GET spy uncalled.
-- **F01** new follow, 200/true; exactly one new actor-target row, pre-existing
-  reverse edge unchanged and no extra reverse edge.
-- **F02/F03** self-follow by exact/uppercase username, 400 and no insert.
-- **F04** missing target, 404 and no insert.
-- **F05** real duplicate constraint, 409 with exactly one existing relation.
-- **F06** two concurrent HTTP POSTs, statuses exactly [200, 409], exact bodies,
-  exactly one persisted actor-target edge.
-- **F07** forged body/query identity, 200; only JWT actor/path target inserted.
-- **F08/F09** unavailable MySQL query/acquisition, exact sanitized 500 and
-  unchanged persisted state; original exception types are observed and rethrown.
-- **U01** existing relation, 200/false; only actor-target removed.
-- **U02** absent relation, 200/false; entire snapshot unchanged.
-- **U03** missing target, 404; entire snapshot unchanged.
-- **U04** repeated DELETE, both 200/false; first removes only actor-target,
-  second leaves the entire resulting snapshot unchanged.
-- **U05** forged body/query identity, 200/false; unrelated relationships retained.
-- **Authentication IDs** are `A-{GET|POST|DELETE}-{kind}`. Each method exercises
-  `malformed`, `invalid`, `wrong-signature`, `expired`, `revoked`, `deleted-user`,
-  `redis-get-outage`, and `redis-disconnected`. POST/DELETE additionally exercise
-  `missing`; anonymous GET is G01. All are 401 except the two Redis-unavailable
-  kinds, which are 503. All preserve the database snapshot taken after fixture
-  preconditions, including intentional actor deletion for `deleted-user`.
-- **J01/J02/J03/J04** signed numeric sub, numeric jti, missing exp, fractional
-  exp respectively; all 401 before Redis GET and without database mutation.
+There are **62 condition cases**:
 
-Every request asserts exact status and entire response body. Successful bodies
-contain exactly `{ profile: { username, bio, image, following } }`, preventing
-email, passwordHash, IDs and timestamps from silently leaking. Error bodies
-assert the established English message and Nest status/error shape, including
-the default sanitized 500 and Redis fail-closed 503.
+- G01-G08: public profiles, authentication, relation direction, missing targets,
+  null public fields and anonymous reads during Redis failure.
+- F01-F10: insertion, self-follow, missing target, idempotent/concurrent duplicates,
+  forged ownership, unavailable MySQL and a duplicate on another unique index.
+- U01-U05: scoped, absent, repeated and forged-ownership deletion, preserving
+  unrelated and reverse relationships.
+- 26 authentication cases: missing/malformed/invalid credentials, wrong signature,
+  expiry, revocation, deleted actor, Redis GET failure and disconnection.
+- J01-J09: numeric sub/JTI, missing/fractional expiry, negative/fractional/string/
+  unsafe/null versions; real signature verification accepts the token before
+  strategy rejection, without a Redis GET or database mutation.
+- V01-V04: legacy version-0 acceptance, legacy rejection at persisted version 1,
+  stale current-token rejection and matching current-token acceptance.
 
-Snapshots hash all selected User columns (including private fields) to verify
-unchanged users without printing private values on failure, compare complete
-ordered Follow rows and count all eight application tables. Mutations compare
-the exact expected Follow difference, unchanged users and unrelated table counts.
+Every response asserts its exact status and entire established English body.
+Public fields are exactly username, bio, image and following. Snapshots hash
+private/public User columns, compare ordered Follow rows and count every
+discovered application base table. Existing state assertions remain intact.
 
-## Lifecycle and independence evidence
+## Shared lifecycle and independence
 
-Commit 1 provisioning, migrations, fixtures, schema/account checks, pinned cleanup
-connection and advisory lease are reused unchanged. All C2 destructive operations
-remain restricted to `nestjs_tutorial_c2_test` on `127.0.0.1:3308` using its
-schema-specific account. No provisioning rerun or migration edit was needed.
+Both suites use [setupC2Suite](../test/c2/helpers/setup-c2-suite.ts) and the
+[guarded lifecycle](c2-test-lifecycle.md). Fresh-state and post-cleanup assertions
+run per case, including filtered cases. Teardown restores mocks and Redis outages
+before independently attempting database and tracked-key cleanup. Failed/partial
+initialization never dereferences missing or stale fixtures. Migration history,
+FK state and absent tracked keys remain checked.
 
-Before every new case, all eight tables must be empty, prior fixture UUIDs and
-tracked Redis keys must be absent, and three fresh users plus a real signed JWT
-are created. Scenario-specific relations are inserted afterward. No increasing
-ID assumption is used.
+The infrastructure suite adds a real temporary future table/view to prove
+rediscovery, counting, truncation, view exclusion and migration preservation.
+Its populated-graph assertion permits additional empty application tables.
+Helper unit regressions cover first/later initialization failures, cleanup and
+shutdown aggregation, JWT/JTI tracking, invalid inventories and FK restoration
+without services.
 
-After every case, spies are restored, any disconnected Redis client is
-reconnected after its actual end event, tracked keys are deleted and the existing
-guarded TRUNCATE cleans exactly the eight allowlisted tables. Teardown asserts
-zero rows, pinned-session FK checks restored to 1, identical migration history
-and absent tracked keys. No global Redis flush or transaction rollback is used.
-Errors are aggregated while database/client shutdown still runs. The dedicated
-lease and serial Jest runner are preserved; C2 commands were never concurrent.
+## Verification and structural coverage
 
-Fresh verification on Node **26.13.0**:
-
-- Full dedicated suite: **62/62**, two suites (10 existing infrastructure + 52 new).
-- Focused profile suite with coverage: **52/52**, one suite.
-- Full deterministic shuffled runs: seeds **41723** and **92811**, **62/62** each.
-- G02, F08, F09, U01 and J04 each passed alone in a separate Jest process
-  (one executed case per command, 51 skipped), proving normal, database-failure,
-  deletion and invalid-claim cases do not require earlier cases.
-- Deliberate failed-assertion probe: a temporary copy changed G01's expected 200
-  to 418. Jest exited **1**, with exactly that one assertion failure and no hook
-  failure. A subsequent read-only verification exited **0**: all eight tables
-  were empty and all five migrations remained. Original teardown also verified
-  Redis keys, FK checks and migration identity. The temporary test was removed.
-
-## Measured structural coverage
-
-Collected using only the 52 new profile cases with `npm.cmd run test:c2:coverage`.
-The dedicated config uses repository root paths so production files are actually
-instrumented, while discovery still includes only `test/c2/**/*.c2-e2e.ts`.
-Generated reports remain ignored under `coverage/c2-profiles/`.
-
-Values below are **statements / branches / functions / lines**, percentages:
-
-- ProfilesController: **100 / 75 / 100 / 100**.
-- ProfilesService: **100 / 86.36 / 100 / 100**.
-- Shared profile mapper: **100 / 100 / 100 / 100**.
-- OptionalJwtAuthGuard: **100 / 100 / 100 / 100**.
-- JwtAuthGuard: **100 / 100 / 100 / 100** (no own instrumented branches/functions).
-- CurrentUser decorator: **100 / 100 / 100 / 100** (no own branches).
-- JwtStrategy: **96 / 82.6 / 100 / 95.65**.
-- RedisService: **70.37 / 50 / 85.71 / 68**.
-- All eight selected files: **92.68 / 78.08 / 95.45 / 91.89**
-  (114/123 statements, 57/73 branches, 21/22 functions, 102/111 lines).
-
-The missing JwtStrategy statement at line 57 is infeasible C-J06 T. Uncovered
-controller/service constructor and decorated-parameter `cond-expr` counters are
-generated TypeScript decorator/type-metadata checks, mapped to declarations rather
-than additional source decisions. Corresponding strategy/Redis injection metadata
-fallback counters are also not request business decisions. RedisService lines
-38-55 belong to `revokeToken`, a logout/issuance path outside this controller;
-that function and its conditions are deliberately not exercised here. No ignore
-pragmas, fabricated principals or production rewrites hide these limitations.
-
-## SunLint and regression gates
-
-SunLint **1.3.56** ran through its supported cached CLI with relative input paths
-and `--all` so the untracked new test was included:
+Use Node.js **26.13.0**. Verify configuration and live schema/account before
+destructive tests. C2 commands run serially under the exclusive schema lease.
 
 ```powershell
-$sunlintCli = 'D:\nestjs-npm-cache\_npx\d135427ecc649769\node_modules\@sun-asterisk\sunlint\cli.js'
-node $sunlintCli --all --input=test/c2/profiles-conditions.c2-e2e.ts --format=json --output=node_modules/.cache/pr6-commit2/sunlint-changed.json --output-summary=node_modules/.cache/pr6-commit2/sunlint-changed-summary.json
-node $sunlintCli --all --input=test --format=json --output=node_modules/.cache/pr6-commit2/sunlint-test.json --output-summary=node_modules/.cache/pr6-commit2/sunlint-test-summary.json
+npm.cmd run test:c2:setup
+npm.cmd run test:c2
+npm.cmd run test:c2:coverage -- --json --outputFile=./node_modules/.cache/mentor-c2-coverage-results.json
+npm.cmd run test:c2 -- --randomize --seed=41723 --showSeed
+npm.cmd test -- --runInBand --cacheDirectory=./node_modules/.cache/jest-mentor-unit
+npm.cmd run test:e2e -- --runInBand --cacheDirectory=./node_modules/.cache/jest-mentor-e2e
+node node_modules/typescript/bin/tsc --noEmit --incremental false
+node node_modules/prettier/bin/prettier.cjs --check "src/**/*.ts" "test/**/*.ts"
+npm.cmd run lint
+npm.cmd run build
+git diff --check
 ```
 
-- Changed TypeScript: **1 file, 0 errors, 18 warnings**, exit **0**.
-- Full test scan: **19 files, 0 errors, 198 warnings**, exit **0**.
-- Multiset comparison by normalized path/rule/severity/message against Commit 1:
-  **180 retained pre-existing warnings, 18 new, 0 removed**.
-- New C018 x4 and C030 x1 at line 468: false positives on an infrastructure
-  observer catch/rethrow. Preserving the original error is necessary to test the
-  real handler; this is not missing application error logging.
-- New S006 x1 at line 608: false positive. The Authorization template contains
-  the generated negative-test JWT, not the random signing secret passed to the
-  signer. It is sent only to the local test app and never logged.
-- New C024 x12: nonblocking style heuristics on readable test names and protocol
-  literals; no confirmed security or correctness defect. No unrelated refactor
-  or warning suppression was added.
-- **Full TypeScript ESLint analysis: NOT VERIFIED.** The CLI reports missing
-  `@typescript-eslint` parser/plugin and an ESLint config. Its 65 heuristic rules
-  plus limited one-rule ESLint engine ran; no dependencies/config were added just
-  for this scanner. The project's separate type-aware oxlint gate passed.
+Generated evidence remains ignored under `coverage/c2-profiles/` and
+`node_modules/.cache/mentor-*.json`. Coverage must be nonempty for all eight
+configured source files. The old pre-merge 52-case figures are superseded;
+current verification results accompany this changeset.
 
-All commands use Node 26.13.0 and writable caches. Final command results:
+The current 62-case coverage run passed. Statements / branches / functions /
+lines, in percent:
 
-- `npm.cmd run test:c2`: exit **0**, 62 passed.
-- `npm.cmd run test:c2:coverage -- --json --outputFile=./node_modules/.cache/pr6-commit2/coverage-tests.json`:
-  exit **0**, 52 passed and nonempty coverage for eight files.
-- `npm.cmd run test:c2 -- --randomize --seed=41723 --showSeed`: exit **0**, 62 passed.
-- Same command with `--seed=92811`: exit **0**, 62 passed.
-- `npm.cmd run test:c2 -- --runTestsByPath test/c2/profiles-conditions.c2-e2e.ts --testNamePattern='\[ID\]'`:
-  exit **0** separately for G02, F08, F09, U01 and J04; one passed each.
-- `npm.cmd test -- --runInBand --cacheDirectory=./node_modules/.cache/jest-pr6-unit`:
-  exit **0**, **367/367**, 21 suites.
-- `npm.cmd run test:e2e -- --runInBand --cacheDirectory=./node_modules/.cache/jest-pr6-e2e`:
-  exit **0**, **567/567**, 11 suites; normal tests retain their existing separate
-  regression database and exclude C2. New C2 code never accesses that schema.
-- `npm.cmd run format`, `npm.cmd run lint`, `npm.cmd run build`: exit **0** each.
-  The formatter's unrelated historical comment-test change was restored.
-- SunLint changed/full commands above: exit **0** each.
-- `git diff --check`: exit **0**. Focused Prettier check of all four changed/new
-  files: exit **0**. Additional `git diff --no-index --check -- /dev/null FILE`
-  checks for both new files emitted no whitespace diagnostics and exited **1**
-  because each file differs from the empty input (expected no-index difference).
+- ProfilesController: **100 / 75 / 100 / 100**.
+- ProfilesService: **100 / 84 / 100 / 100**.
+- Profile mapper, optional/required JWT guards and CurrentUser decorator:
+  **100 / 100 / 100 / 100** each.
+- JwtStrategy: **96 / 86.66 / 100 / 95.65**.
+- RedisService: **70.37 / 50 / 85.71 / 68**.
+- All eight files: **92.68 / 79.51 / 95.45 / 91.89** (114/123 statements,
+  66/83 branches, 21/22 functions, 102/111 lines).
 
-An earlier implementation run exited 1 because Redis disconnection is
-asynchronous; awaiting the real end event fixed it. An initial coverage command
-exited 0 but collected an empty report because source globs were outside Jest's
-root; that result was rejected, the dedicated root/globs were corrected and the
-full 52-case measured run above supersedes it. No `--forceExit` was used.
+Generated decorator/type metadata branches, library internals and infeasible
+C-J06 true are not claimed as covered. Redis token revocation belongs to logout
+outside the controller condition suite. No ignore pragmas or production rewrites
+hide these limits.
 
-Ignored local evidence lives in `node_modules/.cache/pr6-commit2/`: JSON test
-results, gate logs, `failure-cleanup-evidence.json`, `sunlint-comparison.json` and
-scanner reports. Instrumented details are in
-`coverage/c2-profiles/{coverage-final.json,coverage-summary.json,lcov.info}` and
-the HTML report. These generated files are not part of the change.
+SunLint 1.3.56 supplements type-aware oxlint. Include new/untracked helper
+regressions with `--all` and inspect its targeted-file list. Review findings
+against guarded SQL identifiers and deliberately invalid JWT fixtures. Missing
+TypeScript ESLint integration limits scanner analysis and must be reported
+separately from successful heuristic scans.
 
-## Scope and remaining limitations
+## Latest verification results
 
-Changed files are the new profile condition suite and this document, dedicated
-Jest configuration and the package coverage command. Production logic, the shared
-mapper/cache policies, Commit 1 lifecycle helpers, dependencies/lockfile and
-migrations remain unchanged. No confirmed unresolved security/correctness defect
-was found in this scoped work. C-J06 T, generated metadata branches, out-of-scope
-Redis token revocation and unavailable full TypeScript ESLint are the stated
-limits; this report does not claim a whole-application security audit.
+All final checks below exited 0 on Node 26.13.0:
 
-Changes remain unstaged and uncommitted on `feat/e2e-c2-testing`. No branch switch,
-push, PR or Commit 3 work was performed.
+- Prettier check of all source/test TypeScript and the three changed Markdown
+  files, type-aware oxlint, Nest build, full `tsc --noEmit --incremental false`,
+  tracked diff whitespace and new-file whitespace checks.
+- Unit tests with coverage: **590/590**, 28 suites, including **32** focused
+  helper regressions. Command:
+  `npm.cmd run test:cov -- --runInBand --cacheDirectory=./node_modules/.cache/jest-mentor-unit --coverageDirectory=./coverage/mentor-unit --json --outputFile=./node_modules/.cache/mentor-unit-final-results.json`.
+- Normal E2E retry: **620/620**, 11 suites. Command:
+  `npm.cmd run test:e2e -- --runInBand --cacheDirectory=./node_modules/.cache/jest-mentor-e2e --json --outputFile=./node_modules/.cache/mentor-e2e-retry-results.json`.
+  The first run with output `mentor-e2e-results.json` exited 1: 619 passed and one
+  registration case exceeded its existing 5-second timeout while other heavy
+  checks ran. Running E2E alone passed with that original timeout unchanged.
+- Final complete C2 suite: **73/73**, 2 suites (62 controller + 11 infrastructure).
+  Command: `npm.cmd run test:c2 -- --randomize --seed=41723 --showSeed --json --outputFile=./node_modules/.cache/mentor-c2-final-results.json`.
+- C2 coverage: **62/62**, eight nonempty source entries, measured above.
+- Future-table/view regression independently: **1/1**, 10 skipped. Command:
+  `npm.cmd run test:c2 -- --runTestsByPath test/c2/profiles-lifecycle.c2-e2e.ts --testNamePattern='discovers a future' --json --outputFile=./node_modules/.cache/mentor-c2-independent-results.json`.
+- All three migration roundtrips: **1/1 each**, using the existing
+  `test:migration:articles`, `test:migration:comments` and
+  `test:migration:attachments` commands, each with its corresponding
+  `-- --cacheDirectory=./node_modules/.cache/jest-mentor-migration-DOMAIN`.
+  Each runner verified and removed its own disposable MySQL container.
+- Final explicit SunLint scans: **8/8 files analyzed**, **0 errors, 43 warnings**.
+  The three `.spec.ts` files used the inclusion config described in the lifecycle
+  document. Warnings concern test literals, intentional generic failure fixtures,
+  observer rethrows, validated identifier interpolation and configured JWT expiry;
+  no confirmed correctness/security defect remains from this review. The earlier
+  directory scan reported 0 errors and 258 warnings over 28 targeted files.
+  Full TypeScript ESLint integration remains unavailable; type-aware oxlint passed.
 
-Suggested commit: `test(e2e): add C2 coverage for profiles controller`.
+A read-only postflight confirmed all eight current application tables empty,
+all six migrations retained, the lease released, no temporary table/view/index,
+and zero Redis keys matching the C2 namespace. No Redis wildcard deletion was
+performed. The existing stopped MySQL test container was started for verification;
+the token-version migration was applied only to the verified C2 schema.
