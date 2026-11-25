@@ -11,17 +11,6 @@ import {
   C2SafetyError,
 } from './c2-environment';
 
-// Reviewed application-data allowlist. Migrations metadata is never truncated.
-export const C2_TABLES = [
-  'comments',
-  'article_favorites',
-  'article_tags',
-  'articles',
-  'tags',
-  'attachments',
-  'follows',
-  'users',
-] as const;
 const lockName = `${C2_DATABASE}:lifecycle`;
 
 export function assertC2DatabaseOptions(
@@ -37,6 +26,8 @@ export function assertC2DatabaseOptions(
     options.username !== C2_DATABASE_USER ||
     options.synchronize !== false ||
     options.migrationsRun !== false ||
+    (options.migrationsTableName !== undefined &&
+      options.migrationsTableName !== 'migrations') ||
     options.dropSchema === true ||
     options.url !== undefined ||
     options.replication !== undefined ||
@@ -78,7 +69,7 @@ export class C2DatabaseLifecycle {
     if (Number(acquired) !== 1)
       throw new C2SafetyError('Another C2 lifecycle owns this schema');
     this.hasLock = true;
-    await this.assertTables();
+    await this.applicationTables();
     if (await this.dataSource.showMigrations())
       throw new C2SafetyError('Run npm run test:c2:setup before C2 tests');
     await this.truncate();
@@ -91,16 +82,20 @@ export class C2DatabaseLifecycle {
         'C2 cleanup requires an open nontransactional session',
       );
     const [session] = (await this.runner.query(
-      'SELECT DATABASE() AS currentDatabase, CONNECTION_ID() AS sessionId, IS_USED_LOCK(?) AS lockOwner, @@SESSION.foreign_key_checks AS foreignKeyChecks',
+      'SELECT DATABASE() AS currentDatabase, CURRENT_USER() AS currentUser, CONNECTION_ID() AS sessionId, IS_USED_LOCK(?) AS lockOwner, @@SESSION.foreign_key_checks AS foreignKeyChecks',
       [lockName],
     )) as {
       currentDatabase: string;
+      currentUser: string;
       sessionId: number | string;
       lockOwner: number | string | null;
       foreignKeyChecks: number | string;
     }[];
     if (
+      !session ||
       session.currentDatabase !== C2_DATABASE ||
+      typeof session.currentUser !== 'string' ||
+      session.currentUser.split('@')[0] !== C2_DATABASE_USER ||
       (requireLock &&
         (!this.hasLock ||
           String(session.lockOwner) !== String(session.sessionId))) ||
@@ -112,40 +107,49 @@ export class C2DatabaseLifecycle {
     return Number(session.foreignKeyChecks);
   }
 
-  private async assertTables(): Promise<void> {
+  private async applicationTables(): Promise<string[]> {
+    await this.assertSession();
     const tables = (await this.runner.query(
-      "SELECT TABLE_NAME AS tableName FROM information_schema.tables WHERE table_schema = ? AND table_type = 'BASE TABLE'",
+      "SELECT TABLE_NAME AS tableName FROM information_schema.tables WHERE table_schema = ? AND table_type = 'BASE TABLE' ORDER BY TABLE_NAME",
       [C2_DATABASE],
     )) as { tableName: string }[];
-    const expected = [...C2_TABLES, 'migrations'].sort();
     if (
-      JSON.stringify(tables.map(({ tableName }) => tableName).sort()) !==
-      JSON.stringify(expected)
+      !Array.isArray(tables) ||
+      tables.length < 2 ||
+      tables.some(
+        (row) =>
+          !row ||
+          typeof row.tableName !== 'string' ||
+          !/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(row.tableName),
+      ) ||
+      new Set(tables.map(({ tableName }) => tableName)).size !==
+        tables.length ||
+      !tables.some(({ tableName }) => tableName === 'migrations')
     )
-      throw new C2SafetyError(
-        'C2 table inventory differs from the reviewed allowlist',
-      );
+      throw new C2SafetyError('Invalid or empty C2 base-table inventory');
+    return tables
+      .map(({ tableName }) => tableName)
+      .filter((table) => table !== 'migrations');
   }
 
   async counts(): Promise<Record<string, number>> {
-    await this.assertSession();
-    const counts: Record<string, number> = {};
-    for (const table of C2_TABLES) {
+    const counts: [string, number][] = [];
+    for (const table of await this.applicationTables()) {
       const [{ count }] = (await this.runner.query(
         `SELECT COUNT(*) AS count FROM \`${C2_DATABASE}\`.\`${table}\``,
       )) as { count: string }[];
-      counts[table] = Number(count);
+      counts.push([table, Number(count)]);
     }
-    return counts;
+    return Object.fromEntries(counts);
   }
 
   async truncate(): Promise<void> {
     const previousForeignKeyChecks = await this.assertSession();
-    await this.assertTables();
+    const tables = await this.applicationTables();
     const errors: unknown[] = [];
     try {
       await this.runner.query('SET SESSION FOREIGN_KEY_CHECKS = 0');
-      for (const table of C2_TABLES) {
+      for (const table of tables) {
         // Validate the same physical connection immediately before each DDL.
         await this.assertSession();
         await this.runner.query(
