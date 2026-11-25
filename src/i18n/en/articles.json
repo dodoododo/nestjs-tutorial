@@ -1,8 +1,8 @@
 {
   "NOT_FOUND": "Article not found",
   "NOT_AUTHOR": "Only the article author may modify or delete this article",
-  "SLUG_CONFLICT": "An article with an equivalent title already exists; choose a different title",
-  "RESERVED_SLUG": "This title produces the reserved article slug 'feed'; choose a different title",
+  "SLUG_CONFLICT": "Unable to generate a unique article slug; please retry",
   "ALREADY_FAVORITED": "You have already favorited this article",
-  "PERSISTENCE_FAILED": "Unable to persist or retrieve the article"
+  "PERSISTENCE_FAILED": "Unable to persist or retrieve the article",
+  "FAVORITE_INPUT_NOT_EMPTY": "Favorite endpoints accept no request fields"
 }

@@ -1,6 +1,6 @@
 import { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { DataSource, In, QueryFailedError, Repository } from 'typeorm';
 
 import { AppModule } from '../src/app.module';
@@ -15,8 +15,6 @@ import { INVALID_USER_PASSWORD_HASH } from '../src/auth/constants/auth.constant'
 import { ArticleFavorite } from '../src/database/entities/article-favorite.entity';
 import { ArticleTag } from '../src/database/entities/article-tag.entity';
 import { Article } from '../src/database/entities/article.entity';
-import { Attachment } from '../src/database/entities/attachment.entity';
-import { Follow } from '../src/database/entities/follow.entity';
 import { Tag } from '../src/database/entities/tag.entity';
 import { User } from '../src/database/entities/user.entity';
 
@@ -34,8 +32,6 @@ describe('Article foundation (database e2e)', () => {
   const articleIds: string[] = [];
   const tagIds: string[] = [];
   const userIds: string[] = [];
-  const attachmentIds: string[] = [];
-  const newTables = ['articles', 'tags', 'article_tags', 'article_favorites'];
 
   function articleValues(overrides: Partial<Article> = {}) {
     const id = randomUUID();
@@ -68,7 +64,7 @@ describe('Article foundation (database e2e)', () => {
     app = moduleRef.createNestApplication();
     await app.init();
     dataSource = app.get(DataSource);
-    // Guard all fixture writes and destructive migration verification.
+    // Guard all fixture writes; Article DDL runs in the dedicated migration suite.
     if (
       process.env.NODE_ENV !== 'test' ||
       dataSource.options.type !== 'mysql' ||
@@ -111,12 +107,6 @@ describe('Article foundation (database e2e)', () => {
     if (tagIds.length) {
       await tags.delete({ id: In(tagIds) });
       tagIds.length = 0;
-    }
-    if (attachmentIds.length) {
-      await dataSource
-        .getRepository(Attachment)
-        .delete({ id: In(attachmentIds) });
-      attachmentIds.length = 0;
     }
     if (userIds.length) {
       await users.delete({ id: In(userIds) });
@@ -606,98 +596,4 @@ describe('Article foundation (database e2e)', () => {
       });
     }
   });
-
-  it('reverts, reapplies and repeats the migration while preserving all PR2/PR3 records', async () => {
-    // Comments depends on Articles: revert that known descendant first, only
-    // when every table to be dropped is empty in the guarded test database.
-    for (const table of [...newTables, 'comments']) {
-      const [{ count }] = (await dataSource.query(
-        `SELECT COUNT(*) AS count FROM ${table}`,
-      )) as { count: string }[];
-      if (Number(count) !== 0)
-        throw new Error(`Refusing migration roundtrip: nonempty ${table}`);
-    }
-    const previousTables = ['users', 'follows', 'attachments'];
-    await dataSource
-      .getRepository(Follow)
-      .insert({ followerId: viewer.id, followingId: author.id });
-    const attachmentId = randomUUID();
-    attachmentIds.push(attachmentId);
-    await dataSource.getRepository(Attachment).insert({
-      id: attachmentId,
-      attachableType: 'user',
-      attachableId: author.id,
-      url: author.image!,
-      fileName: 'existing-avatar.png',
-      fileType: 'image/png',
-      fileSize: '9007199254740993',
-    });
-    // Compare hashes so failed assertions cannot print password hashes or data.
-    const digest = (value: unknown) =>
-      createHash('sha256').update(JSON.stringify(value)).digest('hex');
-    const snapshot = async () => {
-      const state: Record<string, { rows: string; schema: string }> = {};
-      for (const table of previousTables)
-        state[table] = {
-          rows: digest(
-            await dataSource.query(`SELECT * FROM ${table} ORDER BY id`),
-          ),
-          schema: digest(await dataSource.query(`SHOW CREATE TABLE ${table}`)),
-        };
-      return state;
-    };
-    const before = await snapshot();
-    const history = (await dataSource.query(
-      'SELECT id, timestamp, name FROM migrations ORDER BY id',
-    )) as { id: number; timestamp: string; name: string }[];
-    expect(history.slice(-2).map((migration) => migration.name)).toEqual([
-      'CreateArticles1795178319697',
-      'CreateComments1795251668000',
-    ]);
-    expect(await dataSource.showMigrations()).toBe(false);
-    const runner = dataSource.createQueryRunner();
-    try {
-      await dataSource.undoLastMigration({ transaction: 'none' });
-      expect(await runner.hasTable('comments')).toBe(false);
-      expect(
-        await dataSource.query(
-          'SELECT id, timestamp, name FROM migrations ORDER BY id',
-        ),
-      ).toEqual(history.slice(0, -1));
-      await dataSource.undoLastMigration({ transaction: 'none' });
-      for (const table of newTables)
-        expect(await runner.hasTable(table)).toBe(false);
-      expect(await snapshot()).toEqual(before);
-      expect(
-        await dataSource.query(
-          'SELECT id, timestamp, name FROM migrations ORDER BY id',
-        ),
-      ).toEqual(history.slice(0, -2));
-      const applied = await dataSource.runMigrations({ transaction: 'none' });
-      expect(applied.map((migration) => migration.name)).toEqual([
-        'CreateArticles1795178319697',
-        'CreateComments1795251668000',
-      ]);
-      for (const table of newTables)
-        expect(await runner.hasTable(table)).toBe(true);
-      expect(await runner.hasTable('comments')).toBe(true);
-      expect(await snapshot()).toEqual(before);
-      expect(await dataSource.runMigrations({ transaction: 'none' })).toEqual(
-        [],
-      );
-      expect(await dataSource.showMigrations()).toBe(false);
-      const article = await createArticle();
-      const tag = await createTag();
-      await links.insert({ articleId: article.id, tagId: tag.id });
-      await favorites.insert({ articleId: article.id, userId: viewer.id });
-      expect(await favorites.countBy({ articleId: article.id })).toBe(1);
-    } finally {
-      try {
-        // Restore schema/history even when an assertion after revert fails.
-        await dataSource.runMigrations({ transaction: 'none' });
-      } finally {
-        await runner.release();
-      }
-    }
-  }, 30_000);
 });

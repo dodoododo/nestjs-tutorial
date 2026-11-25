@@ -4,7 +4,6 @@ import {
   InternalServerErrorException,
   Logger,
   NotFoundException,
-  UnauthorizedException,
 } from '@nestjs/common';
 import { I18nService } from 'nestjs-i18n';
 import { DataSource, In, QueryFailedError } from 'typeorm';
@@ -126,7 +125,7 @@ export class CommentsService {
   async createComment(
     slug: string,
     dto: CreateCommentDto,
-    authorId: string,
+    author: User,
   ): Promise<CommentResponseDto> {
     const manager = this.dataSource.manager;
     try {
@@ -136,12 +135,6 @@ export class CommentsService {
       });
       if (!article)
         throw new NotFoundException(this.i18n.t('comments.ARTICLE_NOT_FOUND'));
-      const author = await manager.findOne(User, {
-        where: { id: authorId },
-        select: { username: true, bio: true, image: true },
-      });
-      if (!author) throw new UnauthorizedException();
-
       let saved: Comment;
       try {
         // One atomic INSERT; TypeORM generates the UUID and reloads database
@@ -150,16 +143,13 @@ export class CommentsService {
           Comment,
           {
             articleId: article.id,
-            authorId,
+            authorId: author.id,
             body: dto.body,
           },
           { transaction: false },
         );
       } catch (error: unknown) {
-        if (
-          isArticleForeignKeyFailure(error) &&
-          !(await manager.existsBy(Article, { id: article.id }))
-        ) {
+        if (isArticleForeignKeyFailure(error)) {
           throw new NotFoundException(
             this.i18n.t('comments.ARTICLE_NOT_FOUND'),
           );
@@ -179,8 +169,7 @@ export class CommentsService {
   ): never {
     if (
       error instanceof NotFoundException ||
-      error instanceof ForbiddenException ||
-      error instanceof UnauthorizedException
+      error instanceof ForbiddenException
     )
       throw error;
     // Keep the original diagnostic cause on the exception, but never log SQL,

@@ -34,7 +34,10 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     if (
       typeof payload.sub !== 'string' ||
       typeof payload.jti !== 'string' ||
-      !Number.isInteger(payload.exp)
+      !Number.isInteger(payload.exp) ||
+      (payload.tokenVersion !== undefined &&
+        (!Number.isSafeInteger(payload.tokenVersion) ||
+          payload.tokenVersion < 0))
     ) {
       throw new UnauthorizedException();
     }
@@ -47,7 +50,7 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
       id: payload.sub,
     });
 
-    if (!user) {
+    if (!user || user.tokenVersion !== (payload.tokenVersion ?? 0)) {
       throw new UnauthorizedException();
     }
 

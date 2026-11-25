@@ -6,16 +6,14 @@ import { DataSource, In, Repository } from 'typeorm';
 import { AppModule } from '../src/app.module';
 import { INVALID_USER_PASSWORD_HASH } from '../src/auth/constants/auth.constant';
 import { Attachment } from '../src/database/entities/attachment.entity';
-import { Follow } from '../src/database/entities/follow.entity';
 import { User } from '../src/database/entities/user.entity';
-import { CreateAttachments1795173453495 } from '../src/database/migrations/1795173453495-CreateAttachments';
+import { expectAttachmentSchema } from './helpers/expect-attachment-schema';
 
 describe('Polymorphic attachments (database e2e)', () => {
   let app: INestApplication;
   let dataSource: DataSource;
   let attachmentsRepository: Repository<Attachment>;
   let usersRepository: Repository<User>;
-  let followsRepository: Repository<Follow>;
   const attachmentIds: string[] = [];
   const userIds: string[] = [];
 
@@ -58,20 +56,24 @@ describe('Polymorphic attachments (database e2e)', () => {
     await app.init();
     dataSource = app.get(DataSource);
 
-    // Check isolation before any writes or migration roundtrip. No schema sync.
+    // Check isolation before fixture writes. DDL runs in the disposable suite.
     if (
       process.env.NODE_ENV !== 'test' ||
       dataSource.options.type !== 'mysql' ||
       dataSource.options.host !== '127.0.0.1' ||
       dataSource.options.port !== 3308 ||
       dataSource.options.database !== 'nestjs_tutorial_test' ||
-      dataSource.options.synchronize !== false
+      dataSource.options.synchronize !== false ||
+      dataSource.options.migrationsRun !== false
     ) {
       throw new Error('Unsafe test database configuration');
     }
+    if (await dataSource.showMigrations())
+      throw new Error(
+        'Apply migrations to the guarded E2E database before testing',
+      );
     attachmentsRepository = dataSource.getRepository(Attachment);
     usersRepository = dataSource.getRepository(User);
-    followsRepository = dataSource.getRepository(Follow);
   });
 
   afterEach(async () => {
@@ -89,117 +91,8 @@ describe('Polymorphic attachments (database e2e)', () => {
     await app?.close();
   });
 
-  // Allow real MySQL DDL and restoration to finish before the next test starts.
-  it('runs down/up without changing users or follows and allows repeated migration runs', async () => {
-    // Never drop preexisting attachment metadata, even in the test database.
-    if ((await attachmentsRepository.count()) !== 0) {
-      throw new Error(
-        'Migration roundtrip requires an empty attachments table',
-      );
-    }
-    expect(await dataSource.showMigrations()).toBe(false);
-    const owner = await createUser();
-    const follower = await createUser();
-    const follow = await followsRepository.save({
-      followerId: follower.id,
-      followingId: owner.id,
-    });
-    const usersBefore = await usersRepository.findBy({ id: In(userIds) });
-    const followsBefore = await followsRepository.findBy({ id: follow.id });
-    const usersSchema = await dataSource.query('SHOW CREATE TABLE users');
-    const followsSchema = await dataSource.query('SHOW CREATE TABLE follows');
-    const runner = dataSource.createQueryRunner();
-    const migration = new CreateAttachments1795173453495();
-    let dropped = false;
-    try {
-      await migration.down(runner);
-      dropped = true;
-      expect(await runner.hasTable('attachments')).toBe(false);
-      expect(await usersRepository.findBy({ id: In(userIds) })).toEqual(
-        usersBefore,
-      );
-      expect(await followsRepository.findBy({ id: follow.id })).toEqual(
-        followsBefore,
-      );
-      await migration.up(runner);
-      dropped = false;
-      expect(await runner.hasTable('attachments')).toBe(true);
-      expect(await dataSource.runMigrations({ transaction: 'none' })).toEqual(
-        [],
-      );
-      expect(await dataSource.query('SHOW CREATE TABLE users')).toEqual(
-        usersSchema,
-      );
-      expect(await dataSource.query('SHOW CREATE TABLE follows')).toEqual(
-        followsSchema,
-      );
-      expect(await usersRepository.findBy({ id: In(userIds) })).toEqual(
-        usersBefore,
-      );
-      expect(await followsRepository.findBy({ id: follow.id })).toEqual(
-        followsBefore,
-      );
-    } finally {
-      try {
-        if (dropped && !(await runner.hasTable('attachments'))) {
-          await migration.up(runner);
-        }
-      } finally {
-        await runner.release();
-      }
-    }
-  }, 30_000);
-
   it('matches the required columns, unsigned size and polymorphic index to the migration', async () => {
-    const runner = dataSource.createQueryRunner();
-    try {
-      const table = await runner.getTable('attachments');
-      expect(table).toBeDefined();
-      expect(table!.primaryColumns.map((column) => column.name)).toEqual([
-        'id',
-      ]);
-      const columns: Record<string, number> = {
-        id: 36,
-        attachable_type: 50,
-        attachable_id: 36,
-        url: 2048,
-        file_name: 255,
-        file_type: 127,
-      };
-      for (const [name, length] of Object.entries(columns)) {
-        expect(table!.findColumnByName(name)).toMatchObject({
-          type: 'varchar',
-          length: String(length),
-          isNullable: false,
-        });
-      }
-      expect(table!.findColumnByName('file_size')).toMatchObject({
-        type: 'bigint',
-        unsigned: true,
-        isNullable: false,
-      });
-      expect(table!.findColumnByName('created_at')).toMatchObject({
-        type: 'datetime',
-        precision: 3,
-        isNullable: false,
-      });
-      expect(table!.foreignKeys).toHaveLength(0);
-      expect(table!.indices).toEqual([
-        expect.objectContaining({
-          name: 'IDX_attachments_attachable_type_id',
-          columnNames: ['attachable_type', 'attachable_id'],
-          isUnique: false,
-        }),
-      ]);
-      const entity = dataSource.getMetadata(Attachment);
-      expect(entity.relations).toHaveLength(0);
-      expect(
-        entity.indices[0].columns.map((column) => column.databaseName),
-      ).toEqual(['attachable_type', 'attachable_id']);
-      expect(entity.indices[0].isUnique).toBe(false);
-    } finally {
-      await runner.release();
-    }
+    await expectAttachmentSchema(dataSource);
   });
 
   it('creates valid metadata with a generated UUID and timestamp', async () => {

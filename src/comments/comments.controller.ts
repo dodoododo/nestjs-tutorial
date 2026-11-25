@@ -38,9 +38,10 @@ import { CommentsService } from './comments.service';
 import { CommentResponseDto } from './dto/comment-response.dto';
 import { CreateCommentRequestDto } from './dto/create-comment.dto';
 import { CommentsResponseDto } from './dto/comments-response.dto';
+import { COMMENT_COLLECTION_PATH } from './constants/comment.constant';
 
 @ApiTags('Comments')
-@Controller('articles/:slug/comments')
+@Controller(COMMENT_COLLECTION_PATH)
 export class CommentsController {
   constructor(private readonly comments: CommentsService) {}
 
@@ -115,7 +116,6 @@ export class CommentsController {
   }
 
   @Post()
-  @HttpCode(HttpStatus.CREATED)
   @UseGuards(JwtAuthGuard)
   @UsePipes(
     new ValidationPipe({
@@ -154,6 +154,6 @@ export class CommentsController {
     @Body() body: CreateCommentRequestDto,
     @CurrentUser() principal: AuthenticatedPrincipal,
   ): Promise<CommentResponseDto> {
-    return this.comments.createComment(slug, body.comment, principal.user.id);
+    return this.comments.createComment(slug, body.comment, principal.user);
   }
 }

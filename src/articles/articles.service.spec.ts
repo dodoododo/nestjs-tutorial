@@ -1,3 +1,4 @@
+import * as slugUtil from './utils/article-slug.util';
 import {
   ConflictException,
   ForbiddenException,
@@ -99,32 +100,27 @@ describe('ArticlesService', () => {
 
   afterEach(() => jest.restoreAllMocks());
 
-  describe.each(['feed', 'FEED', 'Fééd', 'ＦＥＥＤ'])(
-    'reserved feed slug generated from %j',
+  describe.each(['feed', 'FEED', 'F\u00e9\u00e9d', '\uff26\uff25\uff25\uff24'])(
+    'routable feed title %j',
     (title) => {
-      it('rejects creation before starting a transaction', async () => {
-        await expect(
-          service.createArticle({ ...dto, title }, 'author'),
-        ).rejects.toMatchObject({
-          status: 400,
-          message: 'articles.RESERVED_SLUG',
-        });
-        expect(transaction).not.toHaveBeenCalled();
-        expect(manager.insert).not.toHaveBeenCalled();
+      it('creates a suffixed slug', async () => {
+        await service.createArticle({ ...dto, title }, 'author');
+        expect(manager.insert).toHaveBeenCalledWith(
+          Article,
+          expect.objectContaining({
+            slug: expect.stringMatching(/^feed-[0-9a-f]{12}$/),
+          }),
+        );
       });
-      it('rejects a title update before writing any supplied fields', async () => {
-        await expect(
-          service.updateArticle(
-            'title',
-            { title, body: 'Must not persist' },
-            'author',
-          ),
-        ).rejects.toMatchObject({
-          status: 400,
-          message: 'articles.RESERVED_SLUG',
-        });
-        expect(manager.update).not.toHaveBeenCalled();
-        expect(manager.existsBy).not.toHaveBeenCalled();
+      it('updates to a suffixed slug', async () => {
+        await service.updateArticle('title', { title }, 'author');
+        expect(manager.update).toHaveBeenCalledWith(
+          Article,
+          { id: 'article-id', authorId: 'author' },
+          expect.objectContaining({
+            slug: expect.stringMatching(/^feed-[0-9a-f]{12}$/),
+          }),
+        );
       });
     },
   );
@@ -418,7 +414,10 @@ describe('ArticlesService', () => {
     expect(manager.insert).toHaveBeenNthCalledWith(
       1,
       Article,
-      expect.objectContaining({ authorId: 'principal-id', slug: 'title' }),
+      expect.objectContaining({
+        authorId: 'principal-id',
+        slug: expect.stringMatching(/^title-[0-9a-f]{12}$/),
+      }),
     );
     expect(manager.query).toHaveBeenCalledWith(
       expect.stringContaining('ON DUPLICATE KEY UPDATE id = id'),
@@ -441,17 +440,122 @@ describe('ArticlesService', () => {
     expect(manager.insert).toHaveBeenCalledTimes(1);
   });
 
-  it('turns only the article slug unique violation into a deliberate conflict', async () => {
+  it('retries a verified slug collision with a different candidate and stable article ID', async () => {
+    const slug = jest
+      .spyOn(slugUtil, 'articleSlug')
+      .mockReturnValueOnce('title-000000000001')
+      .mockReturnValueOnce('title-000000000002');
     manager.insert.mockRejectedValueOnce(
       failure(
         'ER_DUP_ENTRY',
         "Duplicate entry for key 'articles.IDX_articles_slug_unique'",
       ),
     );
+    await service.createArticle({ ...dto, tagList: ['nestjs'] }, 'author');
+    expect(transaction).toHaveBeenCalledTimes(2);
+    const inserts = manager.insert.mock.calls.filter(
+      ([entity]) => entity === Article,
+    );
+    expect(inserts.map(([, value]) => value.slug)).toEqual([
+      'title-000000000001',
+      'title-000000000002',
+    ]);
+    expect(inserts[0][1].id).toBe(inserts[1][1].id);
+    expect(manager.query).toHaveBeenCalledTimes(1);
+    expect(slug).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['create', 'update'] as const)(
+    'bounds verified slug collisions for %s',
+    async (operation) => {
+      jest
+        .spyOn(slugUtil, 'articleSlug')
+        .mockReturnValueOnce('new-000000000001')
+        .mockReturnValueOnce('new-000000000002')
+        .mockReturnValueOnce('new-000000000003');
+      const error = failure(
+        'ER_DUP_ENTRY',
+        "Duplicate entry for key 'articles.IDX_articles_slug_unique'",
+      );
+      if (operation === 'create') manager.insert.mockRejectedValue(error);
+      else manager.update.mockRejectedValue(error);
+      const log = jest
+        .spyOn(Logger.prototype, 'error')
+        .mockImplementation(() => undefined);
+      await expect(
+        operation === 'create'
+          ? service.createArticle(dto, 'author')
+          : service.updateArticle('title', { title: 'New' }, 'author'),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(transaction).toHaveBeenCalledTimes(3);
+      expect(log).not.toHaveBeenCalled();
+    },
+  );
+
+  it('never retries a previously generated candidate', async () => {
+    jest.spyOn(slugUtil, 'articleSlug').mockReturnValue('title-000000000001');
+    manager.insert.mockRejectedValue(
+      failure(
+        'ER_DUP_ENTRY',
+        "Duplicate entry for key 'IDX_articles_slug_unique'",
+      ),
+    );
     await expect(service.createArticle(dto, 'author')).rejects.toBeInstanceOf(
       ConflictException,
     );
     expect(transaction).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    "Duplicate entry IDX_articles_slug_unique for key 'PRIMARY'",
+    "Duplicate entry for key 'articles.IDX_articles_slug_unique_extra'",
+    "Duplicate entry for key 'other.IDX_articles_slug_unique'",
+    "Duplicate entry for key 'IDX_tags_name_unique'",
+  ])('does not retry unrelated duplicate failures: %s', async (message) => {
+    const cause = failure('ER_DUP_ENTRY', message);
+    jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+    manager.insert.mockRejectedValue(cause);
+    await expect(service.createArticle(dto, 'author')).rejects.toMatchObject({
+      status: 500,
+      cause,
+    });
+    expect(transaction).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps separate bounded deadlock and slug retry budgets', async () => {
+    jest
+      .spyOn(slugUtil, 'articleSlug')
+      .mockReturnValueOnce('title-000000000001')
+      .mockReturnValueOnce('title-000000000002')
+      .mockReturnValueOnce('title-000000000003');
+    manager.insert
+      .mockRejectedValueOnce(failure('ER_LOCK_DEADLOCK'))
+      .mockRejectedValueOnce(
+        failure(
+          'ER_DUP_ENTRY',
+          "Duplicate entry for key 'articles.IDX_articles_slug_unique'",
+        ),
+      )
+      .mockRejectedValueOnce(failure('ER_LOCK_DEADLOCK'))
+      .mockRejectedValueOnce(
+        failure(
+          'ER_DUP_ENTRY',
+          "Duplicate entry for key 'articles.IDX_articles_slug_unique'",
+        ),
+      );
+    await service.createArticle(dto, 'author');
+    expect(transaction).toHaveBeenCalledTimes(5);
+    const inserts = manager.insert.mock.calls.filter(
+      ([entity]) => entity === Article,
+    );
+    expect(new Set(inserts.map(([, value]) => value.id)).size).toBe(1);
+    expect(inserts.map(([, value]) => value.slug)).toEqual([
+      'title-000000000001',
+      'title-000000000001',
+      'title-000000000002',
+      'title-000000000002',
+      'title-000000000003',
+    ]);
   });
 
   it('retries the whole transaction after deadlock', async () => {
@@ -524,17 +628,18 @@ describe('ArticlesService', () => {
         select: { id: true, authorId: true, title: true, slug: true },
         lock: { mode: 'pessimistic_write' },
       });
-      expect(manager.existsBy).toHaveBeenCalledWith(
-        Article,
-        expect.objectContaining({ slug: 'duong-di', id: expect.anything() }),
-      );
+      expect(manager.existsBy).not.toHaveBeenCalled();
       expect(manager.update).toHaveBeenCalledWith(
         Article,
         { id: 'article-id', authorId: 'author' },
-        { title: 'Đường đi', slug: 'duong-di', description: 'Changed' },
+        {
+          title: 'Đường đi',
+          slug: expect.stringMatching(/^duong-di-[0-9a-f]{12}$/),
+          description: 'Changed',
+        },
       );
       expect(qb.where).toHaveBeenCalledWith('article.slug = :slug', {
-        slug: 'duong-di',
+        slug: expect.stringMatching(/^duong-di-[0-9a-f]{12}$/),
       });
       expect(manager.insert).not.toHaveBeenCalled();
       expect(manager.delete).not.toHaveBeenCalled();
@@ -575,32 +680,44 @@ describe('ArticlesService', () => {
       });
     });
 
-    it('rejects an existing conflicting slug before writing', async () => {
-      manager.existsBy.mockResolvedValueOnce(true);
-      await expect(
-        service.updateArticle('title', { title: 'Other title' }, 'author'),
-      ).rejects.toBeInstanceOf(ConflictException);
-      expect(manager.update).not.toHaveBeenCalled();
-    });
-
-    it('allows a changed title which normalizes to the same slug', async () => {
+    it('generates a fresh suffixed slug for an equivalent but changed title', async () => {
       await service.updateArticle('title', { title: 'TITLE!' }, 'author');
       expect(manager.existsBy).not.toHaveBeenCalled();
       expect(manager.update).toHaveBeenCalledWith(
         Article,
         { id: 'article-id', authorId: 'author' },
-        { title: 'TITLE!', slug: 'title' },
+        {
+          title: 'TITLE!',
+          slug: expect.stringMatching(/^title-[0-9a-f]{12}$/),
+        },
       );
     });
 
-    it('turns a database slug collision after the precheck into 409', async () => {
+    it('retries an update slug collision from a fresh owned read without a precheck', async () => {
+      jest
+        .spyOn(slugUtil, 'articleSlug')
+        .mockReturnValueOnce('other-000000000001')
+        .mockReturnValueOnce('other-000000000002');
       manager.update.mockRejectedValueOnce(
-        failure('ER_DUP_ENTRY', 'IDX_articles_slug_unique'),
+        failure(
+          'ER_DUP_ENTRY',
+          "Duplicate entry for key 'articles.IDX_articles_slug_unique'",
+        ),
       );
-      await expect(
-        service.updateArticle('title', { title: 'Other' }, 'author'),
-      ).rejects.toBeInstanceOf(ConflictException);
-      expect(qb.getRawAndEntities).not.toHaveBeenCalled();
+      await service.updateArticle(
+        'title',
+        { title: 'Other', body: 'Changed' },
+        'author',
+      );
+      expect(transaction).toHaveBeenCalledTimes(2);
+      expect(manager.findOne).toHaveBeenCalledTimes(2);
+      expect(manager.existsBy).not.toHaveBeenCalled();
+      expect(manager.update).toHaveBeenNthCalledWith(
+        2,
+        Article,
+        { id: 'article-id', authorId: 'author' },
+        { title: 'Other', body: 'Changed', slug: 'other-000000000002' },
+      );
     });
   });
 

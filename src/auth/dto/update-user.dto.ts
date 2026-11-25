@@ -1,42 +1,51 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { Transform, Type } from 'class-transformer';
+import { Type } from 'class-transformer';
 import {
   IsDefined,
-  IsEmail,
   IsObject,
   IsString,
-  MaxLength,
-  MinLength,
   ValidateBy,
   ValidateIf,
   ValidateNested,
 } from 'class-validator';
 
+import {
+  BCRYPT_MAX_BYTES,
+  BIO_MAX_UTF8_BYTES,
+  EMAIL_MAX_LENGTH,
+  PASSWORD_MAX_LENGTH,
+  PASSWORD_MIN_LENGTH,
+  USERNAME_MAX_LENGTH,
+  USERNAME_MIN_LENGTH,
+} from '../constants/auth.constant';
+import {
+  IsPassword,
+  IsUserEmail,
+  IsUsername,
+} from '../decorators/user-validation.decorator';
+
 export class UpdateUserDto {
-  @ApiPropertyOptional({ example: 'jacob', minLength: 3, maxLength: 50 })
-  @Transform(({ value }: { value: unknown }) =>
-    typeof value === 'string' ? value.trim() : value,
-  )
+  @ApiPropertyOptional({
+    example: 'jacob',
+    minLength: USERNAME_MIN_LENGTH,
+    maxLength: USERNAME_MAX_LENGTH,
+  })
   @ValidateIf((_object, value: unknown) => value !== undefined)
-  @IsString()
-  @MinLength(3)
-  @MaxLength(50)
+  @IsUsername()
   username?: string;
 
-  @ApiPropertyOptional({ example: 'jacob@example.com', maxLength: 254 })
-  @Transform(({ value }: { value: unknown }) =>
-    typeof value === 'string' ? value.trim().toLowerCase() : value,
-  )
+  @ApiPropertyOptional({
+    example: 'jacob@example.com',
+    maxLength: EMAIL_MAX_LENGTH,
+  })
   @ValidateIf((_object, value: unknown) => value !== undefined)
-  @IsEmail()
-  @MaxLength(254)
+  @IsUserEmail()
   email?: string;
 
   @ApiPropertyOptional({
     type: String,
     nullable: true,
-    description:
-      'Omit to preserve the bio; null clears it. Empty text is allowed. Maximum 65535 UTF-8 bytes.',
+    description: `Omit to preserve the bio; null clears it. Empty text is allowed. Maximum ${BIO_MAX_UTF8_BYTES} UTF-8 bytes.`,
   })
   @ValidateIf(
     (_object, value: unknown) => value !== undefined && value !== null,
@@ -46,25 +55,22 @@ export class UpdateUserDto {
     name: 'maxBioBytes',
     validator: {
       validate: (value: unknown) =>
-        typeof value === 'string' && Buffer.byteLength(value, 'utf8') <= 65_535,
-      defaultMessage: () => 'bio must not exceed 65535 UTF-8 bytes',
+        typeof value === 'string' &&
+        Buffer.byteLength(value, 'utf8') <= BIO_MAX_UTF8_BYTES,
+      defaultMessage: () =>
+        `bio must not exceed ${BIO_MAX_UTF8_BYTES} UTF-8 bytes`,
     },
   })
   bio?: string | null;
 
-  @ApiPropertyOptional({ minLength: 8, maxLength: 72, writeOnly: true })
-  @ValidateIf((_object, value: unknown) => value !== undefined)
-  @IsString()
-  @MinLength(8)
-  @MaxLength(72)
-  @ValidateBy({
-    name: 'maxBcryptPasswordBytes',
-    validator: {
-      validate: (value: unknown) =>
-        typeof value === 'string' && Buffer.byteLength(value, 'utf8') <= 72,
-      defaultMessage: () => 'password must not exceed 72 UTF-8 bytes',
-    },
+  @ApiPropertyOptional({
+    minLength: PASSWORD_MIN_LENGTH,
+    maxLength: PASSWORD_MAX_LENGTH,
+    writeOnly: true,
+    description: `Maximum ${BCRYPT_MAX_BYTES} UTF-8 bytes. Returns a fresh JWT and invalidates all earlier JWTs on success.`,
   })
+  @ValidateIf((_object, value: unknown) => value !== undefined)
+  @IsPassword()
   password?: string;
 }
 

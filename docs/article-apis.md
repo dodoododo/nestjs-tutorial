@@ -6,8 +6,8 @@ Commit 2 adds `POST /api/articles` and `GET /api/articles/:slug`. Commit 3 adds
 `GET /api/articles/feed`. Commit 6 adds
 `POST /api/articles/:slug/favorite` and `DELETE /api/articles/:slug/favorite`. Schema,
 migrations, `synchronize: false`, and the existing authentication implementation
-remain unchanged. Commit 7 reviews the full PR and reserves the conflicting
-`feed` slug during generation. The request and successful single-article response follow the
+remain unchanged. The mentor-review fixes add random slug suffixes and localized
+Favorite input errors, superseding the earlier reserved-title rejection. The request and successful single-article response follow the
 [RealWorld contract](https://realworld-docs.netlify.app/specifications/backend/endpoints/).
 
 ## Explicit project policies versus RealWorld
@@ -22,8 +22,8 @@ credentials are always rejected.
 
 Other explicit policies include the limit of 100, safe integer offsets, empty
 and unknown query rejection, Unicode/tag normalization and input size bounds,
-deterministic unsuffixed slugs with 409 collisions, rejection of the reserved
-generated slug `feed` with 400, author-only mutations, unchanged-title slug
+readable randomly suffixed slugs with bounded collision retries, routable Feed
+titles, author-only mutations, unchanged-title slug
 stability, empty Update as a no-op, no tag updates, Delete returning 204,
 duplicate Favorite returning 409, and idempotent Unfavorite returning 200.
 The corresponding sections and unit/E2E tests define these choices. Single
@@ -51,27 +51,41 @@ names are deduplicated in the service.
 
 ## Slugs and collisions
 
-Slugs are deterministic: NFKD normalization, lowercase, Vietnamese `đ` to `d`,
-combining marks removed, runs of non-letter/non-number characters replaced with
-hyphens, and outer hyphens removed. Letters and numbers from other scripts remain
-readable. Slugs are truncated at 255 Unicode code points without splitting a
-surrogate pair; trailing hyphens are removed again. A title containing only
-unsupported characters uses `article`.
+The readable prefix retains NFKD normalization, lowercase, Vietnamese `đ` to
+`d`, removal of combining marks, and hyphen-separated Unicode letters/numbers.
+A title with no supported characters uses `article`. Each generated slug appends
+`-` and 12 lowercase hexadecimal characters from Node's `randomBytes(6)`:
+48 bits of cryptographic randomness, with no new dependency. For example,
+`Hello World` can produce `hello-world-a1b2c3d4e5f6`. Equal and accent-equivalent
+titles may be used by the same author or different authors.
 
-The generated slug `feed` is reserved for `GET /api/articles/feed`. Create and
-changed-title Update reject it with localized 400 `articles.RESERVED_SLUG`,
-before inserting an article or writing any Update fields. The check runs after
-slug normalization, so `feed`, `FEED`, `Fééd` and `ＦＥＥＤ` are all rejected.
-Other slugs such as `feed-news` remain valid. Rejected updates preserve body,
-tags, ownership and timestamps. This is a routing policy, not a database unique
-constraint or a change to the slug normalization utility.
+The prefix reserves 13 characters for the separator and suffix. The final slug
+is at most `ARTICLE_SLUG_MAX_LENGTH` (255) UTF-16 units, and therefore at most
+255 database characters. Truncation iterates whole Unicode code points without
+splitting surrogate pairs, then removes trailing hyphens. Unicode slugs remain
+routable when their path segment is URL-encoded.
 
-For example, `Đường đi!` and `DUONG DI` both become `duong-di`. There is no
-automatic numeric suffix: a slug already occupied under MySQL's collation
-returns localized **409 Conflict**, and the caller must change the title. This
-also applies to fallback and truncation collisions. The unique database index
-decides the winner of simultaneous creates. A create never overwrites an existing article.
-The service translates only violations of the named article slug index to 409.
+Titles such as `Feed`, `Fééd` and full-width `ＦＥＥＤ` now produce `feed-<suffix>`.
+They no longer require a reserved-title rejection. Generated slugs cannot equal
+the static `feed` route. Existing rows are not renamed automatically, including
+legacy slugs; unchanged titles retain those slugs.
+
+The existing `IDX_articles_slug_unique` remains the authority. Only MySQL
+`ER_DUP_ENTRY` naming exactly that index (optionally qualified by `articles`)
+is a slug collision. The service retries a rolled-back transaction with a new
+candidate, up to three distinct candidates. A repeated random candidate aborts
+early instead of retrying a known occupied value. Exhaustion returns localized
+**409 Conflict** asking the client to retry; changing the title is not required.
+A suffix collision is still possible: randomness reduces collisions rather than
+proving global uniqueness. Unrelated database failures are not retried as slug
+collisions and retain the existing sanitized 500 behavior.
+
+Create keeps one Article UUID and normalized tag list across retries. Article
+insertion precedes tag writes, so a slug collision does not regenerate tags or
+persist partial relationships. Update retries reacquire the ownership lock and
+preserve UUID, owner, tags and favorites. Slug collisions allow two retries;
+deadlocks retain their separate two-retry budget, so at most five transactions
+run when these failures interleave. Both budgets apply per request.
 
 ## Tags and atomic persistence
 
@@ -89,7 +103,8 @@ inserted into `article_tags`; its composite primary key enforces relationship
 uniqueness. There are no cascade saves or per-tag queries. The returned tag list
 uses stored canonical names in database name order.
 
-MySQL deadlocks retry the entire transaction for at most three total attempts. Any failed
+MySQL deadlocks retry the entire transaction at most twice. Slug collision
+retries have the separate bounded budget described above. Any failed
 transaction rolls back the article, new tags, and associations. Unexpected query
 failures retain their stack/cause in server logs and return an article-specific
 localized 500 without SQL or driver details; other exceptions are rethrown.
@@ -129,13 +144,11 @@ unknown properties return 400. Omitted fields are preserved. `{ "article": {} }`
 returns the current article with 200 after ownership checks, without issuing an
 UPDATE or changing its timestamps.
 
-A changed title regenerates the slug with the existing utility. An unchanged
+A changed title generates a new readable, randomly suffixed slug. An unchanged
 title (after trimming), or an update to only description/body, keeps the current
-slug, including a previously stored custom slug. The collision precheck uses
-MySQL collation and excludes the article's own UUID; a case/accent-equivalent
-value belonging to the same article is allowed. A genuinely conflicting slug
-returns localized 409. The unique index independently handles races after a
-successful precheck, also returning 409 instead of overwriting another article.
+slug, including a previously stored custom slug. No existence precheck is
+needed: the unique index arbitrates collisions, and verified collisions retry
+as described above. Exhausted retries return 409 with no supplied fields saved.
 
 The article UUID, author, creation timestamp, tag links, and favorites survive a
 slug change. The response reuses the existing Single Article DTO and pure
@@ -157,11 +170,10 @@ or response-query failure rolls back the update.
 Only supplied fields are written: simultaneous description/body updates preserve
 both changes. Simultaneous writes to the same field use the last successful
 serialized write. If another mutation first removes or changes a distinct URL
-slug, a waiting request for that old slug returns 404. Slug prechecks do not
-reserve a name; the database constraint arbitrates competing articles.
-Deadlocks retry from a fresh transaction and ownership read, bounded to three
-total attempts. Persistent unexpected database failures use the existing
-sanitized article error, with a single server log preserving the stack/cause.
+slug, a waiting request for that old slug returns 404. The database constraint
+arbitrates competing articles. Deadlocks retry from a fresh transaction and
+ownership read, bounded to two retries in addition to the slug collision budget.
+Persistent unexpected database failures use the existing sanitized article error, with a single server log preserving the stack/cause.
 Expected 403/404/409 errors and non-query exceptions are propagated unchanged.
 
 ## Delete Article (Commit 3)
@@ -349,7 +361,13 @@ article, including its author. Article ownership is not required.
 No body is required. An optional empty JSON object is accepted. The small
 `EmptyFavoriteInputPipe` rejects nonempty body/query objects, arrays and other
 supplied values with 400; neither userId nor articleId can be supplied to choose
-the affected relationship. Use `x-lang` or `Accept-Language` for localization.
+the affected relationship. The pipe is registered in `ArticlesModule` and uses
+the existing injected `I18nService` with `articles.FAVORITE_INPUT_NOT_EMPTY`.
+English: "Favorite endpoints accept no request fields".
+Vietnamese: "Các API yêu thích bài viết không chấp nhận trường dữ liệu trong yêu cầu".
+Use `x-lang` or `Accept-Language` for valid empty-input requests. The existing
+`lang` query resolver still selects the error locale, but the pipe rejects
+nonempty query objects (including `lang`) exactly as before.
 Swagger documents optional empty input, required JWT, the existing Single
 Article success schema and expected error statuses.
 
@@ -369,7 +387,7 @@ return a Single Article, including body. This project's explicit policies are:
 Example requests (no body):
 
 ```http
-POST /api/articles/understanding-nestjs/favorite
+POST /api/articles/understanding-nestjs-a1b2c3d4e5f6/favorite
 Authorization: Bearer <JWT>
 ```
 
@@ -378,7 +396,7 @@ Example 200 response:
 ```json
 {
   "article": {
-    "slug": "understanding-nestjs",
+    "slug": "understanding-nestjs-a1b2c3d4e5f6",
     "title": "Understanding NestJS",
     "description": "A practical introduction",
     "body": "NestJS is a backend framework...",
@@ -398,7 +416,7 @@ Example 200 response:
 ```
 
 ```http
-DELETE /api/articles/understanding-nestjs/favorite
+DELETE /api/articles/understanding-nestjs-a1b2c3d4e5f6/favorite
 Authorization: Bearer <JWT>
 ```
 
@@ -412,8 +430,7 @@ or `Bạn đã yêu thích bài viết này` when Vietnamese is selected.
 The existing `article_favorites` composite primary key `(user_id, article_id)`
 enforces uniqueness. Favorite uses a direct INSERT, with no relationship
 existence precheck. Only `ER_DUP_ENTRY` naming `PRIMARY` or
-`article_favorites.PRIMARY` from that specific INSERT becomes the translated
-409. Unrelated unique keys, foreign-key failures, and errors in response reads
+`article_favorites.PRIMARY` from that specific INSERT becomes the translated 409. Unrelated unique keys, foreign-key failures, and errors in response reads
 are not mistaken for duplicate favorites. Expected conflicts are not logged as
 unexpected errors.
 
@@ -468,7 +485,86 @@ operation on a previously absent relationship can also change viewer state
 before metadata is read. No snapshot guarantee across follow/tag reads is added.
 List/Feed retain their previously documented separate-read limitations.
 
-## Verification
+## Test isolation after the PR3 merge
+
+### Reproduce the isolated Article migration roundtrip
+
+Use Node.js **26.13.0** and a running Docker daemon with permission to create
+containers. From a fresh checkout:
+
+```sh
+npm ci
+npm run test:migration:articles
+```
+
+On Windows use `npm.cmd` if PowerShell execution policy blocks `npm.ps1`.
+The command uses the existing `mysql2`, TypeORM, ts-jest and Jest dependencies;
+no ignored helper, `.env.test`, Redis service or administrator database account
+is required. Docker pulls `mysql:8.4` if it is not already available. `DOCKER_BIN`
+may specify the Docker executable when it is not on PATH. An optional Jest cache
+location can be passed as `-- --cacheDirectory=/path/to/cache`; filtering or
+skipping the required test through runner arguments is rejected.
+
+The tracked entry point `test/migrations/run-article-migration.cjs` delegates to
+`test/migrations/run-disposable-mysql.cjs`, shared with the separate Comments and
+Attachments commands. It creates a uniquely named and labelled disposable
+container. MySQL data lives only in tmpfs, without
+host mounts or persistent volumes. Its only published port is a dynamically
+allocated loopback port (32768–65535), separate from development port 3307 and
+ordinary test port 3308. It generates fresh credentials, uses the schema-scoped
+`article_migration_test` account, and supplies only the dedicated test target:
+`127.0.0.1:<allocated-port>/nestjs_article_migration_test`. Docker's image setup
+uses a separate random root password; neither tests nor migrations connect as
+root. The runner checks actual schema-only account grants, Docker tmpfs settings
+and the kernel `/proc/mounts` entry before allowing migrations. Existing database
+servers and their schemas are never stopped or modified.
+
+The dedicated Jest configuration selects exactly
+`test/migrations/article-migration.roundtrip.ts`. That filename is excluded by
+both ordinary E2E and unit discovery. The spec requires `NODE_ENV=test`, the
+runner's disposable-run marker, valid credentials and a permitted port. It
+ignores ordinary `DB_*` credentials, confirms the server UUID, database, account
+and server hostname against the inspected container ID, and refuses a nonempty
+schema before running any migrations. It
+explicitly applies only the five PR4 migrations, including the later PR3
+token-version migration; future Comments migrations are outside this fixture.
+Guard failures, startup failures, migration failures and test failures produce
+nonzero exits; the test is never conditionally skipped.
+
+The Article migration predates PR3's token-version migration. The dedicated test
+invokes only the Article migration's down/up methods and verifies all migration
+records and PR2/PR3 rows/schema remain unchanged; it never undoes the latest
+migration blindly. Empty Article tables and no inbound foreign keys from
+downstream tables remain prerequisites. Assertions verify all four tables are
+removed and recreated, migration reruns are a no-op, and recreated tables accept
+Article/tag/favorite writes. Partial DDL recovery remains in place.
+
+The runner removes only its own labelled container in `finally`, including when
+Jest fails or SIGINT/SIGTERM interrupts the run. A hard process kill or Docker
+daemon failure may prevent cleanup. If that happens, inspect the exact container
+name printed by the runner and its `nestjs.article-migration-run` label before
+removing that container manually. Do not prune unrelated containers or volumes.
+
+Ordinary Article HTTP/database E2E tests retain their existing strict
+`127.0.0.1:3308/nestjs_tutorial_test` and Redis guards and fixture cleanup. They
+no longer call the Article migration's down/up methods, so a downstream Comments
+foreign key does not require dropping Article tables. With the ordinary test
+MySQL/Redis services running and `.env.test` configured for those guarded targets,
+run these separately from the disposable migration command:
+
+```sh
+npm run test:e2e -- --runInBand --runTestsByPath test/article-database.e2e-spec.ts test/articles.e2e-spec.ts
+npm run test:e2e -- --runInBand
+```
+
+Passing the normal E2E suite does **not** imply the destructive roundtrip ran.
+Run and report `test:migration:articles` separately for migration verification.
+
+## Historical verification (2026-11-21, before mentor fixes)
+
+The following checkpoint records the previous implementation and its test counts.
+Its reserved-title rejection and precheck behavior were superseded by the
+random-suffix policy above. It is not a verification report for the current changes.
 
 ### Final review scope and outstanding dependency risk (Commit 7)
 
