@@ -1,0 +1,24 @@
+{
+  "moduleFileExtensions": ["js", "json", "ts"],
+  "rootDir": "..",
+  "testEnvironment": "node",
+  "testMatch": ["<rootDir>/test/c2/**/*.c2-e2e.ts"],
+  "setupFiles": ["<rootDir>/test/c2/setup-environment.ts"],
+  "cacheDirectory": "<rootDir>/node_modules/.cache/jest-c2",
+  "testTimeout": 30000,
+  "coverageDirectory": "<rootDir>/coverage/c2-profiles",
+  "coverageReporters": ["text", "json", "json-summary", "lcov"],
+  "collectCoverageFrom": [
+    "src/profiles/profiles.controller.ts",
+    "src/profiles/profiles.service.ts",
+    "src/profiles/mappers/profile-response.mapper.ts",
+    "src/auth/decorators/current-user.decorator.ts",
+    "src/auth/guards/jwt-auth.guard.ts",
+    "src/auth/guards/optional-jwt-auth.guard.ts",
+    "src/auth/strategies/jwt.strategy.ts",
+    "src/redis/redis.service.ts"
+  ],
+  "transform": {
+    "^.+\\.(t|j)s$": "ts-jest"
+  }
+}
